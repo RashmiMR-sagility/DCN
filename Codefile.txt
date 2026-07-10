@@ -1,0 +1,1751 @@
+"""
+ExtractCharges_FINAL.py  — v8
+==============================
+Key change over v7 — CRITICAL BUG FIX:
+
+  v7 introduced a "word supplementation" pass intended to recover digits
+  dropped on faint B&W scans. It worked by adding ANY word from a second
+  OCR variant that wasn't within 12px of an existing word. This was too
+  aggressive: OCR bounding boxes routinely shift by 15-40px between
+  different image preprocessing variants (contrast vs adaptive-threshold
+  vs strong-contrast) even for the SAME physical text, so the "is this
+  word already present" check frequently said "no" for words that were
+  actually duplicates. Those duplicates landed in the same visual row
+  (row grouping only checks Y position) and corrupted the row:
+    - Description showed two charge-line texts concatenated together
+    - Rev Code / CPT came from the wrong duplicate fragment
+    - Garbled near-duplicate text appeared as a phantom extra row
+      (e.g. "Coaaulation assessment blopd test plasma pr whoie" next to
+      the correct "Coagulation assessment blood test, plasma or whole
+      blood" row)
+
+  v8 fix: replaced the broad "add any extra word" supplementation with a
+  narrow, safe "digit recovery by replacement" check:
+    - Only considers AMOUNT-shaped tokens (e.g. "14.48"), never
+      descriptions, CPT codes, or rev codes — those are exactly what was
+      causing duplicate/garbled rows.
+    - Never ADDS a new word to the row — only REPLACES an existing word
+      when a candidate from another variant has >60% horizontal box
+      overlap with it (same physical cell, not a neighbor) AND is a
+      strict numeric superset of the existing text (e.g. "14.48" ends
+      with "4.48" — the classic dropped-leading-digit pattern).
+    - This guarantees the row's word COUNT and POSITIONS never change —
+      only a single low-confidence amount string gets corrected in place.
+
+Carried over from v6/v7 (unchanged):
+  - Fixed Footer/metadata lines incorrectly captured as data rows
+  - Fixed Rev Code / CPT being dropped on OCR-split continuation rows
+  - Removed Claude Vision / Anthropic dependency (not available on VDI)
+  - Multi-strategy Rev Code extraction
+  - Data-row-evidence column zone detection
+  - 4-strategy Qty rescue
+  - Continuation page support (header on page 1, data-only on rest)
+  - Accuracy report printed to console and saved in Excel
+"""
+
+import gc, os, re, traceback
+from typing import Dict, List, Optional, Tuple
+
+import fitz
+import numpy as np
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from paddleocr import PaddleOCR
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+INPUT_FOLDER  = r"C:\Users\n643123\Desktop\Table Extraction\input"
+OUTPUT_FOLDER = r"C:\Users\n643123\Desktop\Table Extraction\output"
+OCR_DPI       = 300
+OCR_CONF      = 0.18   # lower = catch more faint text
+DEBUG         = True
+# ──────────────────────────────────────────────────────────────────────────────
+
+COLS = ["Svc Date","Rev Code","CPT#/HCPCS","Mod","Description","Qty","Amount"]
+
+# ── REGEX PATTERNS ─────────────────────────────────────────────────────────────
+# Service date: MM/DD/YY or MM/DD/YYYY — also catches M/D/YY variants
+# Dates with slashes OR dashes: 12/4/2024, 07/28/25, 11-17-2025
+RE_DATE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+
+# Amount: all common formats in medical bills
+RE_AMOUNT = re.compile(
+    r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b"   # 10,318.00 / 1,234,567.89
+    r"|\b\d{1,7}\.\d{2}\b"              # 10318.00
+    r"|\(\d{1,3}(?:,\d{3})*\.\d{2}\)"  # (10.00) — negative amounts
+)
+
+# Revenue code: exactly 3 or 4 digits
+# Handles OCR artifacts: '0300  `0301  ‛0250  0300.
+RE_REV_STRICT = re.compile(r"^\d{3,4}$")
+RE_REV_LOOSE  = re.compile(r"(?<![0-9])(\d{3,4})(?![0-9])")
+
+# CPT / HCPCS codes — comprehensive coverage:
+#   HC25200001  HC11000002          (HC-prefix hospital codes)
+#   J1644  J7050  L0174  Q9967     (letter + 4-5 digits)
+#   80053  36415  99281  71250      (plain 5-digit CPT)
+#   G0463  S9083  T1502  V2020      (G/S/T/V codes)
+RE_CPT = re.compile(
+    r"^(?:"
+    r"HC[A-Z0-9]{3,}"          # HC-prefix codes (hospital billing)
+    r"|[A-Z]\d{4,5}"           # letter + 4-5 digits (J/L/Q/G/S/T/V codes)
+    r"|\d{5}"                  # plain 5-digit CPT
+    r")$",
+    re.I
+)
+
+# Modifier: 1-2 alphanumeric — common modifiers: 25, 26, 59, LT, RT, TC, GA
+RE_MOD = re.compile(r"^[A-Z0-9]{1,2}$", re.I)
+# Known valid modifiers for stricter matching
+_KNOWN_MODS = {
+    "25","26","27","59","50","51","52","53","54","55","56","57","58",
+    "LT","RT","TC","GA","GC","GX","GY","GZ","AT","CG","CR","CS",
+    "KX","QJ","QK","QX","QY","QZ","SB","UC","UN","UP","UQ","UR","US",
+    "AH","AI","AJ","AK","AM","AO","AP","AQ","AR","AS","AU","AV","AW",
+    "73","74","76","77","78","79","80","81","82","99",
+}
+
+# Quantity: 1-4 digit integer
+RE_QTY = re.compile(r"^\d{1,4}$")
+
+# OCR noise: leading apostrophe / backtick / smart-quote / prime before digits
+RE_LEADING_JUNK = re.compile(r"^['\u2018\u2019\u2032\u2035`\u00b4\u02bc\uff07]+")
+
+# NDC code pattern (to exclude from rev code matching)
+RE_NDC = re.compile(
+    r"\d{4,5}-\d{3,4}-\d{2}"   # NDC: 5-4-2 or 5-3-2 or 4-4-2 or 4-3-2
+    r"|\d{11}"                   # NDC 11-digit no hyphens
+    r"|\d{4,5}-\d{3,4}-\d{1,2}" # wider variant
+)
+
+# Compiled patterns for _clean_rev rescue (pre-compiled for speed)
+_RE_MASK_DATE   = RE_DATE
+_RE_MASK_AMOUNT = RE_AMOUNT
+_RE_MASK_5DIGIT = re.compile(r"\b\d{5}\b")
+_RE_MASK_HC     = re.compile(r"\bHC[A-Z0-9]{3,}\b", re.I)
+_RE_MASK_LETTER = re.compile(r"\b[A-Z]\d{4,5}\b", re.I)
+_RE_MASK_NDC    = re.compile(r"\d{4,5}-\d{3,4}-\d{2}")
+
+# ── SKIP / NOISE LISTS ─────────────────────────────────────────────────────────
+_META_KW = [
+    "patient name","member id","date of birth","facility name",
+    "account #","account#","tax id","npi #","npi:","claim #",
+    "invoice no","invoice #","group no","policy no","guarantor",
+    "admit date","disch. date","insurance company","doctor",
+    "subscriber","plan name","group name","date of service",
+    "claim dates of service","total charges","claim date",
+]
+_FOOTER_KW = [
+    "total amount due","all insurance benefits","assigned to",
+    "physician fees are separate","for payment only",
+    "your insurance has processed","amounts are estimated",
+    "the exact amount you owe","all other inquiries",
+    "this is not a bill","view summary","balance due",
+    "total charge","note: amounts are estimated",
+    "this appears to be a long document",
+]
+
+def _lo(t): return str(t).lower()
+
+def _strip_junk(t: str) -> str:
+    """Strip leading OCR artifacts from a token."""
+    return RE_LEADING_JUNK.sub("", t.strip())
+
+def _is_footer(t: str) -> bool:
+    lo = _lo(t)
+    if any(k in lo for k in _FOOTER_KW): return True
+    if re.search(r"\bpage\s+\d+\s+of\s+\d+\b", lo): return True
+    if re.search(r"\bdcn\s*[:#]", lo): return True
+    if re.search(r"\bcti\s*[:#]", lo): return True
+    return False
+
+def _is_meta(t: str) -> bool:
+    lo = _lo(t)
+
+    # Special case: "Charges: 717,776.97" total-charges header label.
+    # This line appears in the PDF metadata block and sometimes gets captured
+    # with a service date because it sits on the same PDF row as
+    # "Date of Service: 07/25/24". Always treat as metadata regardless.
+    if re.search(r"\bcharges\s*:\s*[\d,]+\.\d{2}", lo):
+        return True
+
+    has_meta_kw = any(k in lo for k in _META_KW)
+    if not has_meta_kw:
+        return False
+    if RE_AMOUNT.search(t) and RE_REV_LOOSE.search(t) and RE_DATE.search(t):
+        return False
+    return True
+
+def _is_label(t: str) -> bool:
+    if RE_DATE.search(t) or RE_AMOUNT.search(t): return False
+    lo = _lo(t).strip()
+    for k in ["explanation of charges","itemized charge",
+              "the following document","hospital charge"]:
+        if lo.startswith(k): return True
+    if re.match(r"^page\s+\d", lo): return True
+    if lo in {"charges","charge details","charges:",""}:  return True
+    return False
+
+def _skip(t: str) -> bool:
+    return _is_footer(t) or _is_meta(t) or _is_label(t)
+
+# ── OCR ENGINE ─────────────────────────────────────────────────────────────────
+_ocr = PaddleOCR(
+    use_angle_cls=True, lang="en", show_log=False,
+    use_gpu=False, enable_mkldnn=False,
+    det_model_dir=r"C:\Users\n643123\Downloads\model_file\en_PP-OCRv3_det_infer",
+    rec_model_dir=r"C:\Users\n643123\Downloads\model_file\en_PP-OCRv3_rec_infer",
+    cls_model_dir=r"C:\Users\n643123\Downloads\model_file\ch_ppocr_mobile_v2.0_cls_infer",
+)
+
+# ── WORD CLASS ─────────────────────────────────────────────────────────────────
+class _W:
+    __slots__ = ("text","x","y","x2","y2","conf")
+    def __init__(self, text, x, y, x2, y2, conf=1.0):
+        self.text=str(text); self.x=float(x); self.y=float(y)
+        self.x2=float(x2);   self.y2=float(y2); self.conf=float(conf)
+    @property
+    def cx(self):     return (self.x+self.x2)/2
+    @property
+    def cy(self):     return (self.y+self.y2)/2
+    @property
+    def height(self): return max(1.0, self.y2-self.y)
+    @property
+    def width(self):  return max(1.0, self.x2-self.x)
+
+# ── OCR / PDF WORD EXTRACTION ──────────────────────────────────────────────────
+def _ocr_img(img: np.ndarray, conf: float) -> List[_W]:
+    try:
+        res = _ocr.ocr(img, cls=True)
+    except:
+        return []
+    out = []
+    if not res: return out
+    for line in res:
+        if not line: continue
+        for item in line:
+            try:
+                box = item[0]
+                txt = re.sub(r"\s+", " ", item[1][0]).strip()
+                cf  = float(item[1][1])
+                if not txt or cf < conf: continue
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
+                out.append(_W(txt, min(xs), min(ys), max(xs), max(ys), cf))
+            except:
+                pass
+    return out
+
+def _pdf_words(page) -> List[_W]:
+    out = []
+    try:
+        for item in page.get_text("words"):
+            txt = re.sub(r"\s+", " ", str(item[4])).strip()
+            if txt:
+                out.append(_W(txt, item[0], item[1], item[2], item[3], 1.0))
+    except:
+        pass
+    return out
+
+def _best_words(page) -> Tuple[List[_W], float]:
+    """v8 lean variant set — fast + one adaptive_31 for low-clarity pages."""
+    pix = page.get_pixmap(dpi=OCR_DPI, colorspace=fitz.csRGB)
+    rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
+    pw  = float(pix.width)
+
+    if _HAS_CV2:
+        gray     = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        contrast = cv2.convertScaleAbs(gray, alpha=1.8, beta=20)
+        strong   = cv2.convertScaleAbs(gray, alpha=2.6, beta=35)
+        inv      = cv2.bitwise_not(gray)
+        blur3    = cv2.GaussianBlur(gray, (3, 3), 0)
+        adaptive = cv2.adaptiveThreshold(
+            blur3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 11)
+        variants = [("contrast",contrast),("inverted",inv),
+                    ("gray",gray),("rgb",rgb),
+                    ("strong",strong),("adaptive",adaptive)]
+    else:
+        gray     = rgb.mean(axis=2).astype(np.uint8)
+        contrast = np.clip(gray.astype(np.int32)*1.8+20,0,255).astype(np.uint8)
+        strong   = np.clip(gray.astype(np.int32)*2.6+35,0,255).astype(np.uint8)
+        inv      = (255-gray).astype(np.uint8)
+        variants = [("contrast",contrast),("inverted",inv),
+                    ("gray",gray),("rgb",rgb),("strong",strong)]
+
+    cands = []
+    for name, img in variants:
+        words = _ocr_img(img, OCR_CONF)
+        cands.append((_score_words(words), name, words, pw))
+
+    pdf_w  = _pdf_words(page)
+    pdf_sc = _score_words(pdf_w)
+    if len(pdf_w) < 40: pdf_sc = min(pdf_sc, 3)
+    cands.append((pdf_sc, "pdf", pdf_w, float(page.rect.width)))
+
+    cands.sort(reverse=True)
+    best_sc, best_nm, best_w, best_pw = cands[0]
+    best_w = list(best_w)
+
+    if DEBUG:
+        for sc, nm, wds, _ in cands:
+            print(f"    {nm:12s}: words={len(wds):4d}  score={sc}")
+        print(f"    -> using: {best_nm}  (score={best_sc})")
+
+    # Safe digit-recovery: replace dropped-leading-digit amount tokens only
+    SUPPLEMENT = {"strong","adaptive"}
+    for sc, nm, wds, vpw in cands:
+        if nm == best_nm or nm not in SUPPLEMENT: continue
+        if abs(vpw - best_pw) > 5: continue
+        for cw in wds:
+            ct = cw.text.strip()
+            if not RE_AMOUNT.fullmatch(ct) or len(ct) < 4: continue
+            for i, ow in enumerate(best_w):
+                ox = max(0.0, min(cw.x2,ow.x2) - max(cw.x,ow.x))
+                ww = max(1.0, min(cw.x2-cw.x, ow.x2-ow.x))
+                if abs(cw.cy-ow.cy)<8 and ox/ww>0.60:
+                    ot = ow.text.strip()
+                    if (len(ct)>len(ot) and ct.endswith(ot)
+                            and RE_AMOUNT.fullmatch(ot or "X")):
+                        if DEBUG:
+                            print(f"    Digit recovery: '{ot}' -> '{ct}' (from '{nm}')")
+                        best_w[i] = cw
+                    break
+
+    if best_sc < 30 and pdf_sc >= 10 and len(pdf_w) >= 30:
+        extra = [w for w in pdf_w
+                 if not any(abs(w.cx-ow.cx)<10 and abs(w.cy-ow.cy)<10
+                            for ow in best_w)]
+        if extra:
+            best_w  = best_w + extra
+            best_pw = float(page.rect.width)
+
+    return best_w, best_pw
+
+
+
+def _score_words(words: List[_W]) -> int:
+    rows = _group_rows(words)
+    h = sum(1 for r in rows if _is_hdr(_rtxt(r)))
+    d = sum(1 for r in rows
+            if RE_DATE.search(_rtxt(r))
+            and not _is_footer(_rtxt(r))
+            and not _is_meta(_rtxt(r)))
+    return h*12 + d*5
+
+# ── ROW GROUPING ───────────────────────────────────────────────────────────────
+def _group_rows(words: List[_W]) -> List[List[_W]]:
+    if not words: return []
+    avg_h = sum(w.height for w in words) / len(words)
+    thr   = max(avg_h * 0.75, 5.0)
+    sw    = sorted(words, key=lambda w: (w.cy, w.x))
+    rows, cur, cy = [], [sw[0]], sw[0].cy
+    for w in sw[1:]:
+        if abs(w.cy-cy) <= thr:
+            cur.append(w)
+            cy = sum(ww.cy for ww in cur) / len(cur)
+        else:
+            rows.append(sorted(cur, key=lambda ww: ww.x))
+            cur, cy = [w], w.cy
+    if cur: rows.append(sorted(cur, key=lambda ww: ww.x))
+    return rows
+
+def _rtxt(row: List[_W]) -> str:
+    return re.sub(r"\s+", " ",
+                  " ".join(w.text for w in sorted(row, key=lambda w: w.x))).strip()
+
+# ── HEADER DETECTION ───────────────────────────────────────────────────────────
+_HDR_KW = {
+    "svc":3, "date":2, "service":1, "rev":3, "revenue":2, "code":1,
+    "cpt":4, "hcpcs":4, "procedure":3, "proc":2, "px":3,
+    "mod":2, "modifier":2, "description":4, "descr":3,
+    "qty":3, "quantity":3, "unit":2, "units":2,
+    "amount":3, "amt":3, "billed":3, "charge":2, "charges":2,
+    # new formats (21-PDF set): CDM bills, Txn/Item/NDC layouts
+    "cdm":3, "txn":2, "ndc":3, "rate":1, "item":1, "ref":1,
+    "bill":1, "account":1, "dt":1, "dos":2,
+}
+
+def _hdr_score(text: str) -> int:
+    lo = re.sub(r"[^a-z0-9 ]+", " ", _lo(text))
+    return sum(v for k, v in _HDR_KW.items() if k in lo.split())
+
+def _is_hdr(text: str) -> bool:
+    return _hdr_score(text) >= 5 and not RE_DATE.search(text)
+
+# ── COLUMN ANCHOR DETECTION ────────────────────────────────────────────────────
+# Each column → keywords to identify its header cell
+_COL_KW: Dict[str, List[str]] = {
+    "Svc Date":    ["svc", "dos"],
+    "Rev Code":    ["rev", "revenue"],
+    # "px" → Px Code (image 1/3); order matters: specific first
+    "CPT#/HCPCS":  ["cpt", "hcpcs", "px", "procedure", "proc"],
+    "Mod":         ["mod", "modifier"],
+    "Description": ["description", "descr"],
+    "Qty":         ["qty", "quantity", "units", "unit"],
+    # "amt"/"billed" → CDM Amt, AMT_BILLED, Charge Amount.
+    # "charge(s)" stays LAST so "Charge Code"/"Charge Description" headers
+    # can't steal the Amount anchor (kw-major matching below).
+    "Amount":      ["amount", "amt", "billed", "charges", "charge"],
+}
+
+# Header words that are their own columns in the new formats but have no
+# place in the 7 output columns. They get "ignore zones" so their data
+# (NDC numbers, Txn/Item/CDM/account codes, Bill Refs, CDM Rate) is kept
+# OUT of Rev/CPT/Description instead of polluting them.
+_IGNORE_COL_KW = ["ndc", "txn", "cdm", "item", "account", "rate",
+                  "ref", "bill"]
+
+def _find_anchors(hdr_words: List[_W], pw: float,
+                  data_rows: List[List[_W]] = None) -> Dict[str, float]:
+    """
+    Three-stage anchor detection — Stage 2 (data evidence) ALWAYS runs
+    and ALWAYS wins over Stage 1 (header keywords) for Rev Code and CPT.
+
+    Stage 1 — header keyword scan, KEYWORD-major: for each column, its
+              keywords are tried in priority order against all header
+              words. This lets "Amount" claim the word "Amount" inside
+              "Charge Amount" instead of the earlier word "Charge".
+              Columns claimed from the header are PINNED: Stage 3 will
+              not shove them around (needed for layouts where CPT sits
+              LEFT of Rev Code, e.g. Svc Date | CPT Code | Rev Code | NDC).
+    Stage 1b — leftover header words matching _IGNORE_COL_KW become
+              ignore-zone anchors (__IGNOREn) that swallow their column's
+              data so it never leaks into the 7 output columns.
+    Stage 2 — data-row evidence refinement (unchanged).
+    Stage 3 — fallbacks + minimum spacing, skipped for pinned anchors.
+    """
+    hw = sorted(hdr_words, key=lambda w: w.x)
+
+    # ── Stage 1: keyword matching (keyword-major) ─────────────────────────────
+    all_txt = " ".join(re.sub(r"[^a-z0-9]+"," ", _lo(w.text)) for w in hw)
+    is_f3 = ("rev" in all_txt.split() and "date" in all_txt.split()
+             and "procedure" in all_txt.split() and "svc" not in all_txt.split())
+
+    anchors: Dict[str, float] = {}
+    pinned: set = set()
+    used: set = set()
+    col_order = (["Rev Code","Svc Date","CPT#/HCPCS","Description","Qty","Amount"]
+                 if is_f3 else
+                 ["Svc Date","Rev Code","CPT#/HCPCS","Mod","Description","Qty","Amount"])
+
+    for col in col_order:
+        kws = (["date"] if (col == "Svc Date" and is_f3)
+               else ["svc","dos","date"] if col == "Svc Date"
+               else _COL_KW.get(col, []))
+        found = False
+        for kw in kws:                      # keyword-major
+            for i, w in enumerate(hw):
+                if i in used: continue
+                lo = re.sub(r"[^a-z0-9]+"," ", _lo(w.text))
+                if re.search(r"\b"+re.escape(kw)+r"\b", lo):
+                    anchors[col] = w.x
+                    pinned.add(col)
+                    used.add(i)
+                    found = True
+                    break
+            if found: break
+
+    # ── Stage 1b: ignore-zone anchors for the new formats' extra columns ─────
+    ign_n = 0
+    for i, w in enumerate(hw):
+        if i in used: continue
+        lo = re.sub(r"[^a-z0-9]+"," ", _lo(w.text))
+        if any(re.search(r"\b"+re.escape(kw)+r"\b", lo)
+               for kw in _IGNORE_COL_KW):
+            ign_n += 1
+            anchors[f"__IGNORE{ign_n}"] = w.x
+            used.add(i)
+
+    # ── Stage 2: data-row evidence (ALWAYS runs, overrides Stage 1) ──────────
+    # Scan every data row word and bucket by what it looks like.
+    # Use LEFT edge x for narrow codes (rev, cpt) for accurate zone start.
+    if data_rows:
+        date_xs: List[float] = []
+        rev_xs:  List[float] = []
+        cpt_xs:  List[float] = []
+        amt_xs:  List[float] = []
+
+        for row in data_rows:                   # ALL rows, not just 40
+            row_txt = _rtxt(row)
+            if not RE_DATE.search(row_txt):     # skip non-charge rows
+                continue
+            for w in row:
+                # CRITICAL: strip OCR junk ('0300 → 0300) BEFORE any regex
+                t  = _strip_junk(w.text)
+                tu = t.upper()
+                # Date token — use search (date may have extra chars around it)
+                if RE_DATE.search(t) and len(t) <= 12:
+                    date_xs.append(w.x)
+                # Rev code: strict 3-4 digit only, not a CPT or 5-digit number
+                elif (RE_REV_STRICT.fullmatch(t)
+                      and not RE_CPT.fullmatch(tu)
+                      and len(t) <= 4):
+                    rev_xs.append(w.x)
+                # CPT / HCPCS — strip junk already done above
+                elif RE_CPT.fullmatch(tu):
+                    cpt_xs.append(w.x)
+                # Amount — must have decimal, not be a date
+                elif RE_AMOUNT.search(t) and not RE_DATE.search(t):
+                    amt_xs.append(w.x)
+
+        def _median_x(xs: List[float]) -> Optional[float]:
+            if not xs: return None
+            xs2 = sorted(xs)
+            return xs2[len(xs2)//2]
+
+        # Rev Code: trust data if we have ≥ 2 samples
+        if len(rev_xs) >= 2:
+            data_rev_x = _median_x(rev_xs)
+            if "Rev Code" not in anchors:
+                anchors["Rev Code"] = data_rev_x
+                if DEBUG: print(f"    Rev Code anchor from data rows: {data_rev_x:.0f}")
+            else:
+                hdr_rev_x = anchors["Rev Code"]
+                if abs(hdr_rev_x - data_rev_x) > 15:
+                    if DEBUG:
+                        print(f"    Rev Code: header={hdr_rev_x:.0f} "
+                              f"data={data_rev_x:.0f} → TRUSTING DATA")
+                    anchors["Rev Code"] = data_rev_x
+
+        # CPT: trust data if we have ≥ 2 samples
+        if len(cpt_xs) >= 2:
+            data_cpt_x = _median_x(cpt_xs)
+            if "CPT#/HCPCS" not in anchors:
+                anchors["CPT#/HCPCS"] = data_cpt_x
+                if DEBUG: print(f"    CPT anchor from data rows: {data_cpt_x:.0f}")
+            else:
+                hdr_cpt_x = anchors["CPT#/HCPCS"]
+                if abs(hdr_cpt_x - data_cpt_x) > 15:
+                    if DEBUG:
+                        print(f"    CPT: header={hdr_cpt_x:.0f} "
+                              f"data={data_cpt_x:.0f} → TRUSTING DATA")
+                    anchors["CPT#/HCPCS"] = data_cpt_x
+
+        # Svc Date: trust data
+        if len(date_xs) >= 2:
+            data_date_x = _median_x(date_xs)
+            if "Svc Date" not in anchors:
+                anchors["Svc Date"] = data_date_x
+            elif abs(anchors["Svc Date"] - data_date_x) > 15:
+                anchors["Svc Date"] = data_date_x
+
+        # Amount: trust data
+        if len(amt_xs) >= 2:
+            data_amt_x = _median_x(amt_xs)
+            if "Amount" not in anchors:
+                anchors["Amount"] = data_amt_x
+            elif abs(anchors["Amount"] - data_amt_x) > 20:
+                anchors["Amount"] = data_amt_x
+
+    # ── Stage 3: fallbacks + minimum spacing ──────────────────────────────────
+    if "Amount"   not in anchors: anchors["Amount"]  = pw * 0.91
+    if "Qty"      not in anchors: anchors["Qty"]     = anchors["Amount"] - pw*0.075
+    if "Svc Date" not in anchors: anchors["Svc Date"]= pw * 0.02
+
+    # Rev Code MUST be to the right of Svc Date — unless the header itself
+    # pinned it elsewhere (new layouts place columns in any order)
+    svc_x = anchors["Svc Date"]
+    if "Rev Code" not in anchors:
+        anchors["Rev Code"] = svc_x + pw*0.07
+    elif "Rev Code" not in pinned and anchors["Rev Code"] <= svc_x:
+        anchors["Rev Code"] = svc_x + pw*0.07
+
+    # CPT to the right of Rev Code — SKIPPED when the header pinned CPT
+    # (e.g. Svc Date | CPT Code | Rev Code | NDC | ... has CPT on the LEFT)
+    rev_x = anchors["Rev Code"]
+    if "CPT#/HCPCS" not in anchors:
+        anchors["CPT#/HCPCS"] = rev_x + pw*0.07
+    elif "CPT#/HCPCS" not in pinned and anchors["CPT#/HCPCS"] <= rev_x:
+        anchors["CPT#/HCPCS"] = rev_x + pw*0.07
+
+    # Description zone width guarantee
+    if "Description" not in anchors:
+        narrow = ["Svc Date","Rev Code","CPT#/HCPCS","Mod"]
+        known  = [anchors[c] for c in narrow if c in anchors]
+        anchors["Description"] = (max(known)+anchors["Qty"])/2 if known else pw*0.38
+
+    if anchors["Qty"] - anchors["Description"] < pw*0.25:
+        anchors["Description"] = max(
+            anchors.get("CPT#/HCPCS", pw*0.2) + pw*0.02,
+            anchors["Qty"] - pw*0.25)
+
+    if DEBUG: print(f"    is_f3={is_f3}  final anchors: "
+                    f"{ {k:round(v) for k,v in sorted(anchors.items(),key=lambda x:x[1])} }")
+    return anchors
+
+
+def _build_zones(anchors: Dict[str, float],
+                 pw: float) -> List[Tuple[str, float, float]]:
+    MIN_W = 8.0
+    ordered = sorted(anchors.items(), key=lambda kv: kv[1])
+    for i in range(1, len(ordered)):
+        col, x = ordered[i]
+        if x - ordered[i-1][1] < MIN_W:
+            ordered[i] = (col, ordered[i-1][1] + MIN_W)
+    zones = []
+    for i, (col, x) in enumerate(ordered):
+        left  = (ordered[i-1][1]+x)/2 if i > 0            else 0.0
+        right = (x+ordered[i+1][1])/2 if i+1 < len(ordered) else pw
+        zones.append((col, left, right))
+    return zones
+
+
+# ── WORD → COLUMN ASSIGNMENT ───────────────────────────────────────────────────
+def _split_merged(w: _W) -> List[_W]:
+    """
+    Split OCR tokens that merge multiple fields into one bounding box.
+    Handles:
+      Pattern 1: date+revcode   '07/25/240250' → '07/25/24' + '0250'
+      Pattern 2: junk+revcode   ''0300'        → '0300'
+      Pattern 3: revcode+CPT    '030036415'    → '0300' + '36415'
+      Pattern 4: date+junk      '07/25/25 '    → '07/25/25'
+    """
+    txt = w.text
+
+    # Pattern 1: date immediately followed by 3-4 digit rev code.
+    # Year is FORCED to 2 digits here — with the old greedy \d{2,4} year,
+    # '07/25/240250' split as date='07/25/240' + rev='250' (wrong): the
+    # 4-digit year '2402' backtracked to '240', producing an invalid date
+    # (year '40') which then failed validation, dropped the row's date,
+    # and lost the Rev Code + CPT as a mis-merged continuation line.
+    m = re.match(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2})(\d{3,4})(\D.*)?$", txt)
+    if m:
+        date_part = m.group(1)
+        rev_part  = (m.group(2) + (m.group(3) or "")).strip()
+        frac      = len(date_part) / max(len(txt), 1)
+        sx        = w.x + w.width * frac
+        return [_W(date_part, w.x, w.y, sx,   w.y2, w.conf),
+                _W(rev_part,  sx,  w.y, w.x2, w.y2, w.conf)]
+
+    # Pattern 2: leading junk characters before a rev/CPT code
+    m2 = re.match(r"['\u2018\u2019\u2032\u2035`\u00b4\u02bc\uff07]+(\d.*)", txt)
+    if m2:
+        clean = m2.group(1).strip()
+        return [_W(clean, w.x, w.y, w.x2, w.y2, w.conf)]
+
+    # Pattern 3: 3-4 digit rev code fused with 5-digit CPT (e.g. '030036415')
+    m3 = re.match(r"(\d{3,4})(\d{5})$", txt)
+    if m3:
+        rev_part = m3.group(1)
+        cpt_part = m3.group(2)
+        frac     = len(rev_part) / max(len(txt), 1)
+        sx       = w.x + w.width * frac
+        return [_W(rev_part, w.x, w.y, sx,   w.y2, w.conf),
+                _W(cpt_part, sx,  w.y, w.x2, w.y2, w.conf)]
+
+    # Pattern 4: trailing whitespace/punctuation (normalize)
+    clean4 = txt.strip()
+    if clean4 != txt:
+        return [_W(clean4, w.x, w.y, w.x2, w.y2, w.conf)]
+
+    return [w]
+
+def _assign_row(row: List[_W],
+                zones: List[Tuple[str, float, float]]) -> Dict[str, str]:
+    # Zones may include __IGNOREn columns (NDC/Txn/CDM/Item/Bill Ref...).
+    # Words landing there are captured into those keys and simply never
+    # read by the downstream 7-column pipeline — clean separation.
+    cells = {z[0]: "" for z in zones}
+    for c in COLS:
+        cells.setdefault(c, "")
+    expanded: List[_W] = []
+    for w in row:
+        expanded.extend(_split_merged(w))
+
+    for w in sorted(expanded, key=lambda ww: ww.x):
+        word_w = max(1.0, w.x2 - w.x)
+        best_col, best_frac = zones[0][0], -1.0
+        for col, left, right in zones:
+            ov   = max(0.0, min(w.x2, right) - max(w.x, left))
+            frac = ov / word_w
+            if frac > best_frac:
+                best_col, best_frac = col, frac
+        cells[best_col] = (cells[best_col] + " " + w.text).strip()
+    return cells
+
+# ── CONTINUATION ROW MERGE ─────────────────────────────────────────────────────
+def _merge_continuations(raw: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    """
+    Merge OCR rows that don't start with a date into the previous charge row.
+
+    KEY FIX FOR REPEATED ROWS:
+    When the same charge line appears multiple times (e.g. 5 units of blood
+    compatibility test), OCR bounding boxes for later occurrences sometimes
+    shift slightly, placing the date just outside the Svc Date zone boundary.
+    Result: row["Svc Date"] is empty → treated as continuation → gets
+    merged into Description of previous identical row → amount lost.
+
+    Fix: before treating a row as a continuation, scan the ENTIRE row text
+    for a plausible service date. If found AND the row has other charge
+    evidence (amount OR both rev code + CPT), rescue it as a new charge row.
+    """
+    import datetime
+    _cur_yr = datetime.datetime.now().year % 100
+    _valid_yrs = set(range(20, _cur_yr + 3))
+
+    def _row_has_rescue_date(row: Dict[str,str]) -> str:
+        """Return a plausible date found anywhere in the row, or ''."""
+        joined = " ".join(str(v) for v in row.values())
+        for m in RE_DATE.finditer(joined):
+            try:
+                mo, d, y = m.group(1), m.group(2), m.group(3)
+                y2 = y[-2:]
+                if int(y2) in _valid_yrs and 1<=int(mo)<=12 and 1<=int(d)<=31:
+                    return f"{mo.zfill(2)}/{d.zfill(2)}/{y2}"
+            except Exception:
+                pass
+        return ""
+
+    merged, cur = [], None
+    for row in raw:
+        # Primary check: date in Svc Date zone
+        svc_date = RE_DATE.search(row.get("Svc Date",""))
+        is_new_charge = svc_date is not None
+
+        # Rescue check: no date in zone but date found elsewhere in row
+        if not is_new_charge:
+            rescue_date = _row_has_rescue_date(row)
+            if rescue_date:
+                joined = " ".join(str(v) for v in row.values())
+                has_amount  = bool(RE_AMOUNT.search(joined))
+                has_rev     = bool(_strip_junk(row.get("Rev Code","")).strip())
+                has_cpt     = bool(_strip_junk(row.get("CPT#/HCPCS","")).strip())
+                has_desc    = len(row.get("Description","").strip()) > 4
+                # Rescue if: amount present, OR both rev+cpt present, OR rev+desc
+                evidence = sum([has_amount, has_rev and has_cpt, has_rev and has_desc])
+                if evidence >= 1:
+                    row = dict(row)
+                    row["Svc Date"] = rescue_date
+                    is_new_charge = True
+
+        if is_new_charge:
+            if cur is not None:
+                merged.append(cur)
+            cur = {c: row.get(c, "") for c in COLS}
+        else:
+            if cur is None:
+                continue
+
+            # Promote Rev Code / CPT from continuation if current row lacks them
+            for code_col in ["Rev Code", "CPT#/HCPCS"]:
+                v = row.get(code_col, "").strip()
+                if v and not cur.get(code_col, "").strip():
+                    v_clean = _strip_junk(v)
+                    if code_col == "Rev Code" and RE_REV_STRICT.fullmatch(v_clean):
+                        cur["Rev Code"] = v_clean
+                    elif code_col == "CPT#/HCPCS" and RE_CPT.fullmatch(v_clean.upper()):
+                        cur["CPT#/HCPCS"] = v_clean
+
+            extra = []
+            for c in ["Description", "CPT#/HCPCS", "Mod", "Rev Code"]:
+                v = row.get(c, "").strip()
+                if not v: continue
+                if RE_DATE.search(v) or RE_AMOUNT.search(v): continue
+                v_clean = _strip_junk(v)
+                if c == "Rev Code"    and RE_REV_STRICT.fullmatch(v_clean): continue
+                if c == "CPT#/HCPCS" and RE_CPT.fullmatch(v_clean.upper()): continue
+                extra.append(v)
+            if extra:
+                sep = " " if cur["Description"] else ""
+                cur["Description"] = (cur["Description"] + sep
+                                      + " ".join(extra)).strip()
+            if not cur["Qty"]    and row.get("Qty"):    cur["Qty"]    = row["Qty"]
+            if not cur["Amount"] and row.get("Amount"): cur["Amount"] = row["Amount"]
+
+    if cur is not None:
+        merged.append(cur)
+    return merged
+
+# ── FIELD CLEANERS ─────────────────────────────────────────────────────────────
+def _clean_date(svc_cell: str, joined: str) -> str:
+    """
+    Extract and normalize service date.
+    Scans svc_cell first, then full joined row text.
+    Picks the MOST PLAUSIBLE date when multiple dates exist:
+      - 2-digit year must be 20-29 (i.e. 2020-2029) — reject OCR
+        misreads like "40" (should be "24") or "71" (year 1971 metadata).
+      - Month 1-12, Day 1-31.
+    """
+    import datetime
+    current_year_2d = datetime.datetime.now().year % 100
+    # Accept 2-digit years from 20 to (current_year + 2) to allow future dates
+    VALID_YEARS_2DIGIT = set(range(20, current_year_2d + 3))
+
+    def _norm(m) -> str:
+        mo, d, y = m.group(1), m.group(2), m.group(3)
+        if len(y) == 4:
+            y2 = y[2:]
+        else:
+            y2 = y
+        try:
+            if int(y2) not in VALID_YEARS_2DIGIT: return ""
+            if not (1 <= int(mo) <= 12): return ""
+            if not (1 <= int(d)  <= 31): return ""
+        except ValueError:
+            return ""
+        return f"{mo.zfill(2)}/{d.zfill(2)}/{y2}"
+
+    for src in [svc_cell, joined]:
+        if not src: continue
+        for m in RE_DATE.finditer(src):
+            result = _norm(m)
+            if result:
+                return result
+    return ""
+
+# Module-level set of common hospital revenue codes, used both by
+# _clean_rev's Strategy 9 and by _normalize_rev below.
+_COMMON_REV_SET = {
+    "0100","0101","0110","0111","0120","0121","0130","0131",
+    "0200","0201","0202","0210","0211","0212","0219","0220","0221",
+    "0250","0251","0252","0258","0259",
+    "0270","0271","0272","0273","0274","0275","0276","0277","0278",
+    "0300","0301","0302","0303","0304","0305","0306","0307","0308","0309",
+    "0310","0320","0321","0322","0323","0324","0325","0329",
+    "0350","0351","0352","0360","0361","0369",
+    "0390","0391","0392","0399",
+    "0400","0401","0402","0403","0404","0409",
+    "0410","0411","0412","0413","0419",
+    "0420","0421","0422","0423","0424","0429",
+    "0450","0451","0452","0453","0454","0455","0456","0457","0459",
+    "0460","0461","0469","0480","0481","0482","0483","0489",
+    "0500","0501","0509","0510","0511","0512","0519",
+    "0550","0630","0631","0632","0633","0634","0635","0636","0637","0639",
+    "0710","0711","0719","0720","0721","0722","0723","0724","0729",
+    "0730","0731","0732","0733","0739","0809",
+    "0900","0901","0902","0903","0904","0905","0906","0907","0908","0909",
+    "0910","0911","0912","0913","0914","0915","0916","0917","0918","0919",
+    "0920","0921","0922","0923","0924","0925","0926","0929",
+    "0940","0941","0942","0943","0944","0945","0946","0947","0948","0949",
+}
+
+def _normalize_rev(rev: str) -> str:
+    """
+    Post-normalize a rev code returned by ANY _clean_rev strategy.
+
+    Fixes OCR digit rearrangement (0250 read as 0025, 0300 as 0030):
+    if the value is NOT a known common rev code but a permutation of its
+    digits IS, return the known permutation. Applied to every result —
+    previously this correction lived only in Strategy 9, so a value like
+    '0025' returned directly by Strategy 1 (it looks like a valid 4-digit
+    code) bypassed the correction entirely.
+    """
+    if not rev:
+        return rev
+    s = rev.zfill(4)
+    if s in _COMMON_REV_SET:
+        return s
+    s_sorted = sorted(s)
+    matches = [k for k in _COMMON_REV_SET if sorted(k) == s_sorted]
+    # Only correct when the permutation is UNAMBIGUOUS (exactly one match)
+    if len(matches) == 1:
+        return matches[0]
+    return s
+
+def _clean_rev(cell: str, joined_row: str, cpt: str, amt: str) -> str:
+    """
+    Six-strategy Rev Code extraction — tries each in order, returns first hit.
+    Revenue codes are always exactly 3-4 digits (e.g. 0300, 0250, 110, 0121).
+    """
+    def _is_valid_rev(s: str) -> bool:
+        s = s.strip()
+        if not RE_REV_STRICT.fullmatch(s) or s in {"0000"}:
+            return False
+        sv = s.lstrip("0") or "0"
+
+        # Guard 1: reject if this value is a segment of ANY hyphenated
+        # number in the row (catches NDC codes of ALL formats, lot numbers,
+        # catalog numbers, etc.).
+        # e.g. "68462-469-40" → segments ["68462","469","40"]
+        # so "469" and "0469" would be rejected as Rev Code candidates.
+        for hyph_m in re.finditer(r"\d[\d-]{4,}\d", joined_row):
+            for seg in hyph_m.group(0).split("-"):
+                if seg and (seg.lstrip("0") or "0") == sv:
+                    return False
+
+        # Guard 2: reject if s appears directly glued to a longer digit run
+        # without a word boundary (e.g. "4690" contains "469" but isn't a
+        # standalone rev code).
+        for m in re.finditer(r"(?<!\d)" + re.escape(s) + r"(?!\d)",
+                             joined_row):
+            # Found standalone — that's OK, keep checking
+            pass
+        # Actually check if s ONLY appears embedded (never standalone)
+        standalone = re.search(
+            r"(?<![0-9])" + re.escape(s) + r"(?![0-9])", joined_row)
+        if not standalone:
+            return False   # only appears as part of a longer number
+
+        # Guard 3: reject year-like values
+        try:
+            v = int(s)
+            if 1900 <= v <= 2099:
+                return False
+        except ValueError:
+            pass
+
+        return True
+
+    # ── Strategy 1: cell is exactly a rev code after stripping OCR junk ──────
+    c1 = _strip_junk(cell.strip())
+    if _is_valid_rev(c1):
+        return c1.zfill(4)
+
+    # ── Strategy 2: first token in cell that is a rev code ───────────────────
+    if c1 and c1 != "-":
+        for tok in c1.split():
+            t2 = _strip_junk(tok)
+            if _is_valid_rev(t2):
+                return t2.zfill(4)
+
+    # ── Strategy 3: regex search within cell (non-digit boundary) ────────────
+    if c1 and c1 != "-":
+        for m in re.finditer(r"(?<![0-9])(\d{3,4})(?![0-9])", c1):
+            if _is_valid_rev(m.group(1)):
+                return m.group(1).zfill(4)
+
+    # ── Strategy 4: look for "NNNN CPTCODE" pattern in joined row ────────────
+    # Rev code always appears immediately before CPT code
+    if cpt:
+        m4 = re.search(r"(?<![0-9])(\d{3,4})(?![0-9])\s+" + re.escape(cpt),
+                       joined_row)
+        if m4 and _is_valid_rev(m4.group(1)):
+            return m4.group(1).zfill(4)
+
+    # ── Strategy 5: rescue from joined row after removing known fields ────────
+    text = joined_row
+    text = _RE_MASK_DATE.sub(" DATETOKEN ", text)
+    text = _RE_MASK_AMOUNT.sub(" AMTTOKEN ", text)
+    text = _RE_MASK_NDC.sub(" NDCTOKEN ", text)          # mask NDC codes first
+    if cpt and len(cpt) >= 4: text = text.replace(cpt, " CPTTOKEN ")
+    if amt and len(amt) >= 4: text = text.replace(amt, " AMTTOKEN ")
+    text = _RE_MASK_5DIGIT.sub(" CPTTOKEN ", text)       # 5-digit CPTs
+    text = _RE_MASK_HC.sub(" HCTOKEN ", text)            # HC-prefix codes
+    text = _RE_MASK_LETTER.sub(" CPTTOKEN ", text)       # J1644 etc.
+    for m in re.finditer(r"(?<![0-9])(\d{3,4})(?![0-9])", text):
+        if _is_valid_rev(m.group(1)):
+            return m.group(1).zfill(4)
+
+    # ── Strategy 6: apostrophe-prefixed token anywhere in joined row ──────────
+    for m in re.finditer(
+            r"['\u2018\u2019\u2032\u2035`\u00b4\u02bc]+(\d{3,4})(?![0-9])",
+            joined_row):
+        if _is_valid_rev(m.group(1)):
+            return m.group(1).zfill(4)
+
+    # ── Strategy 7: token immediately preceding CPT/HC code, even with
+    #                trailing punctuation or merged with adjacent letters ──────
+    if cpt:
+        # Look for "<digits><non-digit chars><CPT>" — e.g. "0250.J1644" or "0250-J1644"
+        m7 = re.search(r"(\d{3,4})\D{0,3}" + re.escape(cpt), joined_row)
+        if m7 and _is_valid_rev(m7.group(1)):
+            return m7.group(1).zfill(4)
+        # Look for digits directly glued to the front of the CPT token
+        m7b = re.search(r"(\d{3,4})" + re.escape(cpt), joined_row)
+        if m7b and _is_valid_rev(m7b.group(1)):
+            return m7b.group(1).zfill(4)
+
+    # ── Strategy 8: 3-4 digit token immediately after the service date ──────
+    date_m = RE_DATE.search(joined_row)
+    if date_m:
+        after_date = joined_row[date_m.end():]
+        m8 = re.match(r"\s*[^\d]{0,3}(\d{3,4})(?!\d)", after_date)
+        if m8 and _is_valid_rev(m8.group(1)):
+            return m8.group(1).zfill(4)
+
+    # ── Strategy 9: OCR digit-rearrangement correction ───────────────────────
+    # OCR sometimes rearranges digits of a rev code (e.g. 0250 → 0025,
+    # 0300 → 0030). We detect this by checking if the candidate contains
+    # the same digits as any common rev code in a different order.
+    _COMMON_REV_CODES = {
+        "0100","0101","0110","0111","0120","0121","0130","0131",
+        "0200","0201","0202","0210","0211","0212","0219","0220","0221",
+        "0250","0251","0252","0258","0259",
+        "0270","0271","0272","0273","0274","0275","0276","0277","0278",
+        "0300","0301","0302","0303","0304","0305","0306","0307","0308","0309",
+        "0320","0321","0322","0323","0324","0325","0329",
+        "0350","0351","0352","0360","0361","0369",
+        "0390","0391","0392","0399",
+        "0400","0401","0402","0403","0404","0409",
+        "0410","0411","0412","0413","0419",
+        "0420","0421","0422","0423","0424","0429",
+        "0450","0451","0452","0453","0454","0455","0456","0457","0459",
+        "0460","0461","0469",
+        "0480","0481","0482","0489",
+        "0500","0501","0509",
+        "0510","0511","0512","0519",
+        "0630","0631","0632","0633","0634","0635","0636","0637","0639",
+        "0710","0711","0719",
+        "0720","0721","0722","0723","0724","0729",
+        "0730","0731","0732","0733","0739",
+        "0900","0901","0902","0903","0904","0905","0906","0907","0908","0909",
+        "0910","0911","0912","0913","0914","0915","0916","0917","0918","0919",
+        "0920","0921","0922","0923","0924","0925","0926","0929",
+        "0940","0941","0942","0943","0944","0945","0946","0947","0948","0949",
+    }
+    c1_clean = _strip_junk(cell.strip()).zfill(4)
+    if RE_REV_STRICT.fullmatch(c1_clean) and c1_clean not in _COMMON_REV_CODES:
+        c1_sorted = sorted(c1_clean)
+        for known in _COMMON_REV_CODES:
+            if sorted(known) == c1_sorted:
+                # Same digits, different order → likely OCR rearrangement
+                # Only accept if the known code is a plausible rev code
+                # (starts with 0 is almost always true for hospital rev codes)
+                return known
+
+    return ""
+
+def _clean_cpt(cell: str) -> str:
+    """
+    Extract CPT/HCPCS code with OCR correction for common misreads.
+
+    Key OCR failures seen on this PDF:
+      J1644 → OCR reads "01644" (J misread as 0) or "1644" (J dropped)
+      J3010 → OCR reads "13010" (J misread as 1)
+      J3475 → OCR reads "13475" (J misread as 1)
+    These happen because J looks like 1 or 0 in low-contrast scans.
+    Strategy: if we see a token that looks like a 5-digit number starting
+    with 0 or 1, AND the remaining 4 digits could form a valid J-code or
+    other letter-code, attempt the correction.
+    """
+    t = _strip_junk(cell).upper().strip()
+    if t in {"", "-", "NA", "N/A"}: return ""
+
+    def _fix_ocr_code(tok: str) -> str:
+        """
+        Try to correct common OCR misreads of HCPCS/CPT codes.
+
+        J-code ranges that OCR misreads (J→0 or J→1):
+          J1xxx: 01xxx or 11xxx  — but 11xxx is also a real CPT range
+          J2xxx: 02xxx           — safe (02xxx is not a real CPT range)
+          J3xxx: 03xxx or 13xxx  — 03xxx not real CPT, 13xxx might be
+          J7xxx: 07xxx or 17xxx  — 07xxx not real CPT, 17xxx not real
+          J8xxx: 08xxx or 18xxx  — 08xxx not real CPT, 18xxx not real
+          J9xxx: 09xxx or 19xxx  — 09xxx not real CPT, 19xxx might be
+
+        Real 5-digit CPT code ranges to NOT convert:
+          10xxx-19xxx: Surgery (integumentary system etc.)
+          11xxx: Surgery (debridement etc.)  ← conflict with J1xxx
+
+        Strategy: for 5-digit tokens starting 0X/1X, only apply J-code
+        correction when the corrected code appears in a curated set of
+        J/C/L/Q codes actually used in hospital billing for the PDFs
+        we process.
+        """
+        tok = _strip_junk(tok)
+
+        # ── Curated set of HCPCS codes commonly OCR-misread as 5-digit numbers
+        # Covers J-codes, C-codes, L-codes, Q-codes seen in these PDFs
+        _KNOWN_HCPCS_CORRECTIONS = {
+            # J-codes (injections/infusions)
+            "J0696","J1644","J1650","J1939","J2001","J2250","J2270",
+            "J3010","J3030","J3262","J3301","J3370","J3475","J7030",
+            "J7040","J7050","J7120","J7130","J8499","J9999",
+            # C-codes (outpatient devices/drugs)
+            "C1750","C1769","C1894","C2621",
+            # L-codes (orthotics)
+            "L0174","L3000",
+            # Q-codes
+            "Q0081","Q0083","Q0084","Q0085",
+        }
+
+        # For 5-digit tokens: try J-code correction FIRST against known set
+        if re.fullmatch(r"\d{5}", tok):
+            # "01644" → "J1644", "13010" → "J3010", etc.
+            candidate = "J" + tok[1:]
+            if candidate in _KNOWN_HCPCS_CORRECTIONS:
+                return candidate
+            # Also try C/L/Q codes
+            for prefix in ["C","L","Q"]:
+                candidate2 = prefix + tok[1:]
+                if candidate2 in _KNOWN_HCPCS_CORRECTIONS:
+                    return candidate2
+            # If not in known set, return as-is (trust it's a real CPT)
+            if RE_CPT.fullmatch(tok):
+                return tok
+
+        # ── Direct match for letter+digit codes and HC-codes ─────────────────
+        if RE_CPT.fullmatch(tok):
+            return tok
+
+        # "1644" (4 digits) → "J1644" : J dropped entirely
+        if re.fullmatch(r"[1-9]\d{3}", tok):
+            candidate = "J" + tok
+            if RE_CPT.fullmatch(candidate):
+                return candidate
+        # "0644" → "J0644" etc.
+        if re.fullmatch(r"0\d{3}", tok):
+            candidate = "J" + tok
+            if RE_CPT.fullmatch(candidate):
+                return candidate
+        return ""
+
+    # Try each token in the cell
+    for tok in t.split():
+        tok2 = _strip_junk(tok)
+        result = _fix_ocr_code(tok2)
+        if result:
+            return result
+
+    # Regex search: find known CPT patterns anywhere in cell text.
+    # IMPORTANT: each hit must go through _fix_ocr_code — tokens with
+    # trailing punctuation (e.g. "17050." or "17050,") fail the
+    # token-level fullmatch above, land here via findall as "17050",
+    # and previously got returned RAW without the J→1 OCR correction.
+    hits = re.findall(
+        r"HC[A-Z0-9]{3,}"    # HC-prefix codes (HC25200001 etc.)
+        r"|[A-Z]\d{4,5}"     # letter + 4-5 digits (J1644, C1769, etc.)
+        r"|\b\d{5}\b",        # 5-digit CPT (80053, 82330 etc.)
+        t)
+    for hit in hits:
+        corrected = _fix_ocr_code(hit)
+        if corrected:
+            return corrected
+    if hits:
+        return hits[0]
+
+    # Last resort: try OCR correction on any 4-5 digit token
+    for tok in t.split():
+        tok2 = _strip_junk(tok)
+        if re.fullmatch(r"\d{4,5}", tok2):
+            result = _fix_ocr_code(tok2)
+            if result:
+                return result
+
+    return ""
+
+def _clean_mod(cell: str) -> str:
+    t = _strip_junk(cell).upper().strip()
+    if not t or t in {"-", "NA", "N/A", ""}: return ""
+    # Try exact match against known modifiers first (most reliable)
+    for tok in t.split():
+        tok2 = _strip_junk(tok).upper()
+        if tok2 in _KNOWN_MODS:
+            return tok2
+    # Fall back: 1-2 alphanumeric, not pure digits (those are qty)
+    for tok in t.split():
+        tok2 = _strip_junk(tok).upper()
+        if RE_MOD.fullmatch(tok2) and not tok2.isdigit() and len(tok2) <= 2:
+            return tok2
+    return ""
+
+def _clean_qty(cell: str, joined_row: str = "", desc: str = "",
+               amt: str = "") -> str:
+    """
+    Extract quantity with multiple strategies (mirrors the Rev Code approach):
+
+    Strategy 1 — direct from the Qty cell (most reliable when zone is correct)
+    Strategy 2 — rescue from joined row: look for a standalone 1-4 digit
+                 token sitting immediately BEFORE the amount (Qty always
+                 sits directly to the left of Amount in every format seen)
+    Strategy 3 — rescue from the tail of Description if it ends in a bare
+                 number that isn't part of a measurement/NDC code
+                 (e.g. "...100 ML VIAL" should NOT match, but a trailing
+                 lone integer right before the amount position should)
+    Strategy 4 — default to "1" when the row clearly has a charge
+                 (Description and/or Amount present) and every other
+                 strategy failed — this matches real-world billing data
+                 where an omitted Qty always means quantity of one.
+    """
+    def _valid_qty(s: str, context: str = "") -> Optional[int]:
+        if not s: return None
+        s = _strip_junk(s.strip())
+        if not re.fullmatch(r"\d{1,4}", s): return None
+        v = int(s)
+        if not (1 <= v <= 9999): return None
+        if 1900 <= v <= 2100: return None     # year
+        if v > 999: return None               # unrealistic dispensing qty
+
+        # Guard: reject if this number appears embedded in an alphanumeric
+        # product/catalog code (e.g. "035x75", "C1750", "C1769").
+        # A standalone qty is surrounded by spaces, start/end, or the
+        # amount value — NOT immediately adjacent to letters.
+        if context:
+            # Look for this exact digit sequence immediately preceded or
+            # followed by a letter (without a space separator)
+            embedded = re.search(
+                r"[A-Za-z]" + re.escape(s) + r"|" + re.escape(s) + r"[A-Za-z]",
+                context)
+            if embedded:
+                return None
+
+        return v
+
+    # ── Strategy 1: direct cell value ─────────────────────────────────────────
+    t = cell.strip()
+    if t and not RE_DATE.search(t) and not RE_AMOUNT.search(t) \
+            and not RE_NDC.search(t):
+        t_clean = _strip_junk(t)
+        m = re.search(r"\b(\d{1,4})\b", t_clean)
+        if m:
+            v = _valid_qty(m.group(1), context=joined_row)
+            if v is not None:
+                # Additional guard: reject if this value is a segment of
+                # any hyphenated number in the row (NDC tail digits like
+                # "57" from "63323-492-57")
+                sv = m.group(1).lstrip("0") or "0"
+                ndc_seg = any(
+                    (seg.lstrip("0") or "0") == sv
+                    for hyph_m in re.finditer(r"\d[\d-]{4,}\d", joined_row)
+                    for seg in hyph_m.group(0).split("-")
+                    if seg
+                )
+                if not ndc_seg:
+                    return str(v)
+
+    # ── Strategy 2: standalone digit token immediately before the amount ──────
+    if amt and joined_row:
+        amt_pattern = re.escape(amt.lstrip("-"))
+        m2 = re.search(r"(?<![\d.])(\d{1,4})\s+\$?" + amt_pattern, joined_row)
+        if m2:
+            # Guard: reject if the qty candidate is immediately preceded by
+            # a 4+ digit number (catalog/lot sequence like "55150 297 197.98"
+            # or "43066 400 335.81"). Real qty is always at the START of the
+            # qty column, never embedded in a multi-number catalog string.
+            pre_start = max(0, m2.start(1) - 15)
+            before_text = joined_row[pre_start:m2.start(1)].strip()
+            catalog_before = bool(re.search(r"\d{4,}\s*$", before_text))
+            if not catalog_before:
+                v = _valid_qty(m2.group(1), context=joined_row)
+                if v is not None:
+                    return str(v)
+
+    # ── Strategy 3: trailing bare integer in Description that isn't part
+    #                of a dosage/measurement phrase ─────────────────────────
+    if desc:
+        # Reject if the number is immediately followed by a unit word
+        # (ML, MG, MCG, UNIT, VIAL, TAB, BAG, etc.) — that's a dose, not Qty
+        unit_words = (r"ML|MG|MCG|UNIT|UNITS|VIAL|TAB|TABS|BAG|CAP|CAPS|"
+                     r"SOLN|SYRG|SYRINGE|G|MMOL|MEQ|GM")
+        tail_m = re.search(r"(?<![\d.])(\d{1,3})\s*$", desc.strip())
+        if tail_m:
+            # Check the number isn't immediately preceded by a unit word either
+            before = desc[:tail_m.start()].strip()
+            if not re.search(r"(?:" + unit_words + r")\s*$", before, re.I):
+                v = _valid_qty(tail_m.group(1))
+                if v is not None:
+                    return str(v)
+
+    # ── Strategy 4: default to 1 when the row is clearly a real charge ───────
+    if amt or desc:
+        return "1"
+
+    return ""
+
+def _clean_amount(cell: str, joined: str) -> str:
+    """
+    Extract dollar amount — rightmost match wins.
+    Also handles negative amounts in parentheses: (10.00) → -10.00
+    """
+    for src in [cell, joined]:
+        hits = list(RE_AMOUNT.finditer(src))
+        if hits:
+            raw = hits[-1].group(0).strip()
+            negative = raw.startswith("(") and raw.endswith(")")
+            raw = raw.strip("()").replace(",", "")
+            try:
+                v = float(raw)
+                return f"-{v:.2f}" if negative else f"{v:.2f}"
+            except:
+                pass
+    return ""
+
+def _clean_desc(desc: str, cpt: str, mod: str,
+                qty: str, amt: str, date: str) -> str:
+    d = re.sub(r"\s+", " ", desc).strip()
+    # Remove document noise
+    d = re.sub(r"\bpage\s+\d+\s+of\s+\d+\b", " ", d, flags=re.I)
+    d = re.sub(r"\bdcn\s*[:#][^\n]*",          " ", d, flags=re.I)
+    d = re.sub(r"\bcti\s*[:#][^\n]*",          " ", d, flags=re.I)
+    d = re.sub(r"\binvoice\s*[:#][^\n]*",       " ", d, flags=re.I)
+    # Remove confirmed field values that leaked into description
+    for val in [date, cpt, mod, qty, amt]:
+        if val and len(val) >= 3:
+            d = re.sub(r"(?<!\w)"+re.escape(val)+r"(?!\w)",
+                       " ", d, flags=re.I)
+    # Remove trailing/leading punctuation artifacts
+    d = re.sub(r"^[\s\-|:,;.]+", "", d)
+    d = re.sub(r"[\s\-|:,;.]+$", "", d)
+    return re.sub(r"\s+", " ", d).strip()
+
+def _clean_row(row: Dict[str,str]) -> Optional[List[str]]:
+    joined = " ".join(row.values())
+    if _skip(joined): return None
+
+    date = _clean_date(row.get("Svc Date",""), joined)
+    if not date: return None
+
+    amt  = _clean_amount(row.get("Amount",""), joined)
+    cpt  = _clean_cpt(row.get("CPT#/HCPCS",""))
+    rev  = _normalize_rev(_clean_rev(row.get("Rev Code",""), joined, cpt, amt))
+    mod  = _clean_mod(row.get("Mod",""))
+    desc_raw = re.sub(r"\s+", " ", row.get("Description","")).strip()
+
+    # Qty needs the raw description (before field-stripping) and the
+    # joined row text so its rescue strategies can find positional evidence
+    qty  = _clean_qty(row.get("Qty",""), joined_row=joined,
+                      desc=desc_raw, amt=amt)
+
+    desc = _clean_desc(desc_raw, cpt, mod, qty, amt, date)
+
+    if not cpt and not desc and not amt: return None
+    if _is_footer(joined) or _is_meta(joined): return None
+    return [date, rev, cpt, mod, desc, qty, amt]
+
+# ── SECTION FINDING ────────────────────────────────────────────────────────────
+def _find_sections(rows: List[List[_W]]):
+    hdr_idxs = [i for i,r in enumerate(rows) if _is_hdr(_rtxt(r))]
+
+    if hdr_idxs:
+        sections = []
+        for pos, hi in enumerate(hdr_idxs):
+            ds = hi + 1
+            # Absorb stacked sub-header line
+            if ds < len(rows):
+                nxt = _rtxt(rows[ds])
+                if _is_hdr(nxt) and not RE_DATE.search(nxt):
+                    ds += 1
+            de = hdr_idxs[pos+1] if pos+1 < len(hdr_idxs) else len(rows)
+            while de > ds and _skip(_rtxt(rows[de-1])): de -= 1
+            sections.append((hi, ds, de))
+        return _dedup(sections)
+
+    # No header — find data rows and search backward for header
+    charge_idxs = [i for i,r in enumerate(rows)
+                   if RE_DATE.search(_rtxt(r))
+                   and not _is_footer(_rtxt(r))
+                   and not _is_meta(_rtxt(r))]
+    if charge_idxs:
+        hi = -1
+        for probe in range(charge_idxs[0]-1, max(-1, charge_idxs[0]-8), -1):
+            t = _rtxt(rows[probe])
+            if _hdr_score(t) >= 3 and not RE_DATE.search(t):
+                hi = probe; break
+        de = len(rows)
+        while de > charge_idxs[0] and _skip(_rtxt(rows[de-1])): de -= 1
+        return [(hi, charge_idxs[0], de)]
+
+    # Last resort
+    bf = [i for i,r in enumerate(rows)
+          if RE_DATE.search(_rtxt(r)) and not _is_footer(_rtxt(r))]
+    return [(-1, bf[0], bf[-1]+1)] if bf else []
+
+def _dedup(sections):
+    if len(sections) <= 1: return sections
+    secs = sorted(sections, key=lambda s: s[1])
+    kept = [secs[0]]
+    for cand in secs[1:]:
+        _, cs, ce = cand; _, ks, ke = kept[-1]
+        overlap = max(0, min(ce,ke) - max(cs,ks))
+        if ce > cs and overlap/(ce-cs) > 0.50:
+            if ce-cs > ke-ks: kept[-1] = cand
+        else:
+            kept.append(cand)
+    return kept
+
+def _empirical_zones(data_rows: List[List[_W]], pw: float):
+    date_xs, rev_xs, cpt_xs, amt_xs = [], [], [], []
+    for row in data_rows[:40]:
+        for w in row:
+            t = _strip_junk(w.text)
+            if RE_DATE.search(t):              date_xs.append(w.cx)
+            elif RE_REV_STRICT.fullmatch(t):   rev_xs.append(w.x)  # use left edge
+            elif RE_CPT.fullmatch(t.upper()):  cpt_xs.append(w.cx)
+            elif RE_AMOUNT.fullmatch(t):       amt_xs.append(w.cx)
+    def _med(lst): return sorted(lst)[len(lst)//2] if lst else None
+    anchors: Dict[str,float] = {}
+    if _med(date_xs): anchors["Svc Date"]    = _med(date_xs)
+    if _med(rev_xs):  anchors["Rev Code"]    = _med(rev_xs)
+    if _med(cpt_xs):  anchors["CPT#/HCPCS"] = _med(cpt_xs)
+    anchors["Amount"]      = _med(amt_xs) or pw*0.91
+    anchors["Qty"]         = anchors["Amount"] - pw*0.075
+    anchors["Description"] = (anchors.get("CPT#/HCPCS", pw*0.25) + anchors["Qty"])/2
+    if "Svc Date" not in anchors: anchors["Svc Date"] = pw*0.02
+    return _build_zones(anchors, pw)
+
+# ── PAGE EXTRACTION ────────────────────────────────────────────────────────────
+_last_zones: Optional[List] = None
+_last_pw:    float           = 0.0
+
+def _process_page(page, pg_no: int):
+    global _last_zones, _last_pw
+
+    words, pw = _best_words(page)
+    rows      = _group_rows(words)
+    sections  = _find_sections(rows)
+
+    out, dbg = [], []
+
+    if DEBUG:
+        dc = sum(1 for r in rows if RE_DATE.search(_rtxt(r))
+                 and not _is_footer(_rtxt(r)))
+        print(f"  words={len(words):4d}  rows={len(rows):3d}  "
+              f"sections={len(sections)}  charge_rows≈{dc}")
+
+    for sec_no, (hi, ds, de) in enumerate(sections, 1):
+        data_rows_raw = rows[ds:de]
+
+        if hi >= 0:
+            hdr_words = list(rows[hi])
+            nxt = hi+1
+            if nxt < ds and _is_hdr(_rtxt(rows[nxt])) and not RE_DATE.search(_rtxt(rows[nxt])):
+                hdr_words += rows[nxt]
+            if DEBUG:
+                print(f"    sec {sec_no} hdr@{hi}: '{_rtxt(hdr_words)[:80]}'")
+            # Pass data rows to _find_anchors for Stage 2 evidence
+            anchors = _find_anchors(hdr_words, pw, data_rows=data_rows_raw)
+            zones   = _build_zones(anchors, pw)
+            _last_zones = zones; _last_pw = pw
+            if DEBUG:
+                for col, l, r in zones:
+                    print(f"      {col:15s} [{l:5.0f}–{r:5.0f}]")
+        else:
+            if _last_zones and abs(pw - _last_pw) < 30:
+                zones = _last_zones
+                if DEBUG: print(f"    sec {sec_no} no header — reusing zones")
+            else:
+                zones = _empirical_zones(data_rows_raw, pw)
+                _last_zones = zones; _last_pw = pw
+                if DEBUG: print(f"    sec {sec_no} no header — empirical zones")
+
+        raw_dicts = []
+        for row in data_rows_raw:
+            txt = _rtxt(row)
+            if not txt: continue
+            if _is_footer(txt) or _is_meta(txt) or _is_label(txt):
+                dbg.append([pg_no, sec_no, "skip", txt]); continue
+            if _is_hdr(txt) and not RE_DATE.search(txt):
+                dbg.append([pg_no, sec_no, "skip-hdr", txt]); continue
+
+            assigned = _assign_row(row, zones)
+            dbg.append([pg_no, sec_no, "raw", txt]
+                       + [assigned[c] for c in COLS])
+            raw_dicts.append(assigned)
+
+        merged = _merge_continuations(raw_dicts)
+        for rd in merged:
+            final = _clean_row(rd)
+            if final:
+                out.append(final)
+                dbg.append([pg_no, sec_no, "FINAL", ""] + final)
+            else:
+                dbg.append([pg_no, sec_no, "rejected",
+                            " ".join(rd.values())])
+
+    if DEBUG: print(f"  → {len(out)} rows emitted")
+    return out, dbg
+
+# ── DUPLICATE ROW SUPPRESSION ───────────────────────────────────────────────────
+def _dedup_final_rows(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Remove only TRUE duplicate rows — i.e. exact copies produced when a PDF
+    renders the same charge table twice (fax-repeat, page-overlap artifacts).
+
+    IMPORTANT: Hospital billing PDFs legitimately have the SAME Rev Code +
+    CPT + Description repeated many times in a row (e.g. 5 units of a drug
+    on consecutive lines, each with Qty=1). These must NOT be deduplicated.
+
+    A row is a true duplicate ONLY when ALL SEVEN fields match exactly —
+    including Description AND Qty. This is strict enough to catch fax-repeat
+    artifacts (which are verbatim copies) while preserving genuine repeated
+    charge lines that may differ in Description wording or Qty.
+    """
+    seen: set = set()
+    out:  List[List[str]] = []
+    for row in rows:
+        # Use all 7 fields as the key — strict match only
+        key = tuple(row)
+        if key in seen:
+            # Only skip if we've seen this EXACT row before (all fields identical)
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _carry_forward_amounts(rows: List[List[str]]) -> List[List[str]]:
+    """
+    For rows missing an Amount: borrow from nearby rows with same Rev+CPT.
+    Safe because same service code always has the same unit price on one bill.
+    """
+    result = [list(r) for r in rows]
+    amt_cache: Dict[str, str] = {}
+    for row in result:
+        rev, cpt, amt = row[1], row[2], row[6]
+        if rev and cpt and amt:
+            amt_cache[f"{rev}|{cpt}"] = amt
+    for row in result:
+        if not row[6] and row[1] and row[2]:
+            cached = amt_cache.get(f"{row[1]}|{row[2]}", "")
+            if cached:
+                row[6] = cached
+    return result
+
+
+def _dkey_precise(desc: str) -> str:
+    """Precise key: first 6 normalized words (digits included)."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", desc.lower()).split()
+    return " ".join(words[:6])
+
+def _dkey_loose(desc: str) -> str:
+    """
+    Loose fallback key: first 2 ALPHABETIC words of length >= 4.
+    Digits and short tokens are dropped, so an OCR garble inside the
+    dosage part of a drug name ("0.25 Ma/Ml" vs "0.25 Mg/Ml") does not
+    change the key: both variants of
+        "Bumetanide 0.25 Mg/Ml Soln (68462-469-40)"
+        "Bumetanide 0.25 Ma/Ml Soln (68462-469-4"
+    reduce to "bumetanide soln".
+    Returns "" when fewer than 2 qualifying words exist (key too weak).
+    """
+    words = [w for w in re.sub(r"[^a-z ]+", " ", desc.lower()).split()
+             if len(w) >= 4]
+    if len(words) < 2:
+        return ""
+    return " ".join(words[:2])
+
+def _carry_forward_rev_codes(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Fill blank Rev Codes using TWO-TIER description-keyed global maps.
+
+    Tier 1 — precise key (first 6 normalized words). Exact repeated rows
+    match here.
+
+    Tier 2 — loose key (first 2 alphabetic words >= 4 chars). Catches rows
+    where OCR garbled a character inside the first 6 words, e.g.
+    "Bumetanide 0.25 Ma/Ml Soln" (OCR) vs "Bumetanide 0.25 Mg/Ml Soln"
+    (clean) — the precise keys differ ("ma" vs "mg") but both reduce to
+    the loose key "bumetanide soln".
+
+    BOTH tiers use a uniqueness guard: a key seen with two different rev
+    codes fills nothing. E.g. "room charge" (loose key for both
+    "HC ROOM CHARGE PVT MONITOR" and "HC ROOM CHARGE PRIVATE") maps to
+    {0110} only, so it fills; but a loose key mapping to {0250, 0300}
+    would be skipped.
+
+    Pass 3 afterwards: same-date neighbor majority vote for rows whose
+    description matched nothing (unique one-off garbled rows).
+    """
+    from collections import Counter
+    result = [list(r) for r in rows]
+    n = len(result)
+
+    # Build both maps from rows that have rev + description
+    precise_map: Dict[str, set] = {}
+    loose_map:   Dict[str, set] = {}
+    for row in result:
+        if row[1] and row[4]:
+            pk = _dkey_precise(row[4])
+            if len(pk) >= 8:
+                precise_map.setdefault(pk, set()).add(row[1])
+            lk = _dkey_loose(row[4])
+            if lk:
+                loose_map.setdefault(lk, set()).add(row[1])
+
+    # Fill blanks: precise first, loose fallback — unique match only
+    for row in result:
+        if row[1] or not row[0] or not row[4]:
+            continue
+        pk = _dkey_precise(row[4])
+        revs = precise_map.get(pk, set())
+        if len(revs) == 1:
+            row[1] = next(iter(revs))
+            continue
+        lk = _dkey_loose(row[4])
+        if lk:
+            revs = loose_map.get(lk, set())
+            if len(revs) == 1:
+                row[1] = next(iter(revs))
+
+    # Pass 3 — fallback: same-date neighbor majority vote
+    for i, row in enumerate(result):
+        if row[1] or not row[0]:
+            continue
+        date = row[0]
+        nearby: List[str] = []
+        for j in range(max(0, i-4), min(n, i+5)):
+            if j == i: continue
+            if result[j][0] == date and result[j][1]:
+                nearby.append(result[j][1])
+        if not nearby:
+            continue
+        top_rev, top_count = Counter(nearby).most_common(1)[0]
+        if top_count >= max(1, len(nearby) * 0.6):
+            row[1] = top_rev
+
+    return result
+
+
+def _carry_forward_cpt_codes(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Fill blank CPT codes using the same TWO-TIER description-keyed maps
+    as the rev-code fill (precise 6-word key, then loose 2-alphabetic-word
+    fallback), each with a uniqueness guard.
+
+    The loose tier is what recovers OCR-garbled repeats: a Bumetanide row
+    whose description OCR'd as "Bumetanide 0.25 Ma/Ml Soln" gets no
+    precise-key match against the clean "Mg/Ml" rows, but its loose key
+    "bumetanide soln" maps to exactly {J1939} → filled.
+
+    Ambiguity stays safe: "HC ROOM CHARGE PVT MONITOR" (HC11000002) and
+    "HC ROOM CHARGE PRIVATE" (HC11000001) share the loose key
+    "room charge" → the set has two CPTs → nothing is filled from the
+    loose tier, while their precise keys differ and still fill correctly.
+
+    Rows whose description genuinely has no CPT anywhere in the document
+    (pharmacy lines printed with "-") get no map entry and stay blank.
+    """
+    result = [list(r) for r in rows]
+
+    precise_map: Dict[str, set] = {}
+    loose_map:   Dict[str, set] = {}
+    for row in result:
+        if row[2] and row[4]:
+            pk = _dkey_precise(row[4])
+            if len(pk) >= 8:
+                precise_map.setdefault(pk, set()).add(row[2])
+            lk = _dkey_loose(row[4])
+            if lk:
+                loose_map.setdefault(lk, set()).add(row[2])
+
+    for row in result:
+        if row[2] or not row[0] or not row[4]:
+            continue
+        pk = _dkey_precise(row[4])
+        cpts = precise_map.get(pk, set())
+        if len(cpts) == 1:
+            row[2] = next(iter(cpts))
+            continue
+        lk = _dkey_loose(row[4])
+        if lk:
+            cpts = loose_map.get(lk, set())
+            if len(cpts) == 1:
+                row[2] = next(iter(cpts))
+
+    return result
+
+
+
+def _report_accuracy(rows: List[List[str]], filename: str):
+    n    = len(rows)
+    fill = [sum(1 for r in rows if r[i].strip()) for i in range(len(COLS))]
+    pct  = [round(100*f/n) for f in fill]
+    req  = [0, 4, 6]  # Svc Date, Description, Amount
+    comp = sum(1 for r in rows if all(r[i].strip() for i in req))
+    print(f"\n  ── ACCURACY: {filename} ({n} rows) ──")
+    for i, col in enumerate(COLS):
+        bar = "█"*(pct[i]//5) + "░"*(20 - pct[i]//5)
+        print(f"    {col:15s} {bar} {pct[i]:3d}%  ({fill[i]}/{n})")
+    print(f"    {'OVERALL':15s} {'':20s} {round(100*comp/n):3d}%  ({comp}/{n})")
+    return fill, pct, comp, n
+
+# ── PDF PROCESSING ─────────────────────────────────────────────────────────────
+def process_pdf(path: str):
+    global _last_zones, _last_pw
+    _last_zones = None; _last_pw = 0.0
+
+    stem = os.path.splitext(os.path.basename(path))[0]
+    dest = os.path.join(OUTPUT_FOLDER, stem + ".xlsx")
+
+    all_rows: List[List[str]] = []
+    all_dbg:  List[list]      = []
+
+    print(f"\n{'='*65}\nFILE: {os.path.basename(path)}\n{'='*65}")
+
+    doc = fitz.open(path)
+    try:
+        for pi in range(len(doc)):
+            print(f"\n-- Page {pi+1}/{len(doc)} --")
+            try:
+                r, d = _process_page(doc[pi], pi+1)
+                all_rows.extend(r); all_dbg.extend(d)
+                gc.collect()
+            except Exception as e:
+                print(f"  ERROR page {pi+1}: {e}"); traceback.print_exc()
+    finally:
+        doc.close()
+
+    before_dedup = len(all_rows)
+    all_rows = _dedup_final_rows(all_rows)
+    all_rows = _carry_forward_rev_codes(all_rows)   # fill blank Rev Codes
+    all_rows = _carry_forward_cpt_codes(all_rows)   # fill blank CPT codes
+    all_rows = _carry_forward_amounts(all_rows)     # fill blank Amounts
+    removed = before_dedup - len(all_rows)
+    if removed and DEBUG:
+        print(f"\n  Removed {removed} duplicate row(s) "
+              f"(same Svc Date + Rev Code + CPT + Amount)")
+
+    acc = _report_accuracy(all_rows, os.path.basename(path))
+    _write_excel(all_rows, all_dbg, acc, dest)
+    print(f"\nDone: {len(all_rows)} rows  →  {dest}")
+
+# ── EXCEL WRITER ───────────────────────────────────────────────────────────────
+def _write_excel(rows, dbg, acc_data, path: str):
+    wb = Workbook(); ws = wb.active; ws.title = "Charges"
+    hfill = PatternFill("solid", fgColor="1F4E79")
+    hfont = Font(bold=True, color="FFFFFF", size=11)
+    ha    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for ci, col in enumerate(COLS, 1):
+        c = ws.cell(row=1, column=ci, value=col)
+        c.fill=hfill; c.font=hfont; c.alignment=ha
+
+    if rows:
+        for ri, row in enumerate(rows, 2):
+            for ci, val in enumerate(row, 1):
+                ws.cell(row=ri, column=ci, value=val)
+    else:
+        ws.cell(row=2, column=1, value="No charge rows detected")
+
+    for ci, w in enumerate([13,10,14,7,65,7,14], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 28
+
+    # Accuracy sheet
+    if acc_data and rows:
+        fill, pct, comp, n = acc_data
+        ac = wb.create_sheet("Accuracy")
+        ac.append(["Column","Filled","Total","Fill %"])
+        for c in ac[1]: c.fill=hfill; c.font=hfont; c.alignment=ha
+        for i, col in enumerate(COLS):
+            ac.append([col, fill[i], n, pct[i]])
+        ac.append(["OVERALL (Svc+Desc+Amt)", comp, n, round(100*comp/n)])
+        for ci, w in enumerate([24,10,10,10], 1):
+            ac.column_dimensions[get_column_letter(ci)].width = w
+
+    # Debug sheet
+    ds = wb.create_sheet("Debug_Raw")
+    ds.append(["Page","Sec","Status","Raw_Text"] + COLS)
+    for c in ds[1]: c.fill=hfill; c.font=hfont; c.alignment=ha
+    for row in dbg: ds.append([str(v) for v in row])
+    for ci, w in enumerate([6,6,14,110,13,10,14,7,65,7,14], 1):
+        ds.column_dimensions[get_column_letter(ci)].width = w
+    ds.freeze_panes = "A2"
+
+    wb.save(path)
+    print(f"  Saved → {path}")
+
+# ── ENTRY POINT ────────────────────────────────────────────────────────────────
+def run():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    try:
+        files = sorted(f for f in os.listdir(INPUT_FOLDER)
+                       if f.lower().endswith(".pdf"))
+    except Exception:
+        print(f"Cannot read: {INPUT_FOLDER}"); traceback.print_exc(); return
+    print(f"Found {len(files)} PDF(s)")
+    for fn in files:
+        try:    process_pdf(os.path.join(INPUT_FOLDER, fn))
+        except Exception as e:
+            print(f"\nFATAL: {fn}: {e}"); traceback.print_exc()
+
+if __name__ == "__main__":
+    run()
