@@ -71,7 +71,8 @@ COLS = ["Svc Date","Rev Code","CPT#/HCPCS","Mod","Description","Qty","Amount"]
 
 # ── REGEX PATTERNS ─────────────────────────────────────────────────────────────
 # Service date: MM/DD/YY or MM/DD/YYYY — also catches M/D/YY variants
-RE_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b")
+# Dates with slashes OR dashes: 12/4/2024, 07/28/25, 11-17-2025
+RE_DATE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
 
 # Amount: all common formats in medical bills
 RE_AMOUNT = re.compile(
@@ -165,26 +166,19 @@ def _is_footer(t: str) -> bool:
     return False
 
 def _is_meta(t: str) -> bool:
-    """
-    A line is metadata (patient info, NPI, dates of service header, etc.)
-    if it contains a metadata keyword — REGARDLESS of whether a date is
-    present, because metadata lines like 'Date of Birth: 06/30/1969' or
-    'Date of Service: 07/25/24 - 08/08/24' legitimately contain dates.
-    We only treat the date as "this is a real charge row" when the line
-    ALSO has a dollar amount AND does not match a metadata keyword.
-    """
     lo = _lo(t)
+
+    # Special case: "Charges: 717,776.97" total-charges header label.
+    # This line appears in the PDF metadata block and sometimes gets captured
+    # with a service date because it sits on the same PDF row as
+    # "Date of Service: 07/25/24". Always treat as metadata regardless.
+    if re.search(r"\bcharges\s*:\s*[\d,]+\.\d{2}", lo):
+        return True
+
     has_meta_kw = any(k in lo for k in _META_KW)
     if not has_meta_kw:
         return False
-    # If it has a meta keyword AND a real charge-row amount AND multiple
-    # dates (date range) it's still metadata (e.g. "Date of Service: X-Y").
-    # Only escape the metadata classification if there's a meta keyword
-    # but the line also has Rev/CPT-code-like structure typical of a
-    # genuine charge row (date + 3-4 digit code + amount together).
     if RE_AMOUNT.search(t) and RE_REV_LOOSE.search(t) and RE_DATE.search(t):
-        # Looks like an actual charge row that happens to mention a
-        # meta keyword in its description text — let it through
         return False
     return True
 
@@ -198,8 +192,19 @@ def _is_label(t: str) -> bool:
     if lo in {"charges","charge details","charges:",""}:  return True
     return False
 
+def _is_total_row(t: str) -> bool:
+    """'120 Total', 'Subtotal $3,968.00', 'Total Charges' summary rows."""
+    lo = re.sub(r"\s+", " ", _lo(t)).strip()
+    if re.match(r"^\d{2,4}\s+total\b", lo): return True
+    if lo.startswith("subtotal"): return True
+    if re.match(r"^total\b", lo): return True
+    if re.search(r"\b\d{2,4}\s+total\s*$",
+                 RE_AMOUNT.sub(" ", lo).strip()): return True
+    return False
+
 def _skip(t: str) -> bool:
-    return _is_footer(t) or _is_meta(t) or _is_label(t)
+    return (_is_footer(t) or _is_meta(t) or _is_label(t)
+            or _is_total_row(t))
 
 # ── OCR ENGINE ─────────────────────────────────────────────────────────────────
 _ocr = PaddleOCR(
@@ -369,10 +374,13 @@ def _rtxt(row: List[_W]) -> str:
 # ── HEADER DETECTION ───────────────────────────────────────────────────────────
 _HDR_KW = {
     "svc":3, "date":2, "service":1, "rev":3, "revenue":2, "code":1,
-    "cpt":4, "hcpcs":4, "procedure":3, "proc":2,
-    "mod":2, "modifier":2, "description":4,
+    "cpt":4, "hcpcs":4, "procedure":3, "proc":2, "px":3,
+    "mod":2, "modifier":2, "description":4, "descr":3,
     "qty":3, "quantity":3, "unit":2, "units":2,
-    "amount":3, "charge":2, "charges":2,
+    "amount":3, "amt":3, "billed":3, "charge":2, "charges":2,
+    # new formats (21-PDF set): CDM bills, Txn/Item/NDC layouts
+    "cdm":3, "txn":2, "ndc":3, "rate":1, "item":1, "ref":1,
+    "bill":1, "account":1, "dt":1, "dos":2,
 }
 
 def _hdr_score(text: str) -> int:
@@ -387,11 +395,33 @@ def _is_hdr(text: str) -> bool:
 _COL_KW: Dict[str, List[str]] = {
     "Svc Date":    ["svc", "dos"],
     "Rev Code":    ["rev", "revenue"],
-    "CPT#/HCPCS":  ["cpt", "hcpcs", "procedure", "proc"],
+    # "px" → Px Code (image 1/3); order matters: specific first
+    "CPT#/HCPCS":  ["cpt", "hcpcs", "px", "procedure", "proc"],
     "Mod":         ["mod", "modifier"],
-    "Description": ["description"],
+    "Description": ["description", "descr"],
     "Qty":         ["qty", "quantity", "units", "unit"],
-    "Amount":      ["amount", "charges", "charge"],
+    # "amt"/"billed" → CDM Amt, AMT_BILLED, Charge Amount.
+    # "charge(s)" stays LAST so "Charge Code"/"Charge Description" headers
+    # can't steal the Amount anchor (kw-major matching below).
+    "Amount":      ["amount", "amt", "billed", "charges", "charge"],
+}
+
+# Header words that are their own columns in the new formats but have no
+# place in the 7 output columns. They get "ignore zones" so their data
+# (NDC numbers, Txn/Item/CDM/account codes, Bill Refs, CDM Rate) is kept
+# OUT of Rev/CPT/Description instead of polluting them.
+_IGNORE_COL_KW = ["ndc", "txn", "cdm", "item", "account", "rate",
+                  "ref", "bill", "charge"]
+
+# Two-word column names that deserve their OWN column even though their
+# words individually collide with canonical keywords ("Charge Code" vs
+# the Amount keyword "charge"; "Item Number"; MFSMC's second description
+# column "Charge Description"). Matched against ADJACENT unclaimed header
+# words — always anchored, no proximity guard, because an explicit
+# two-word phrase is unambiguous evidence of a real column.
+_IGNORE_PHRASES = {
+    "charge code", "txn code", "item number", "account number",
+    "bill ref", "cdm rate", "charge description",
 }
 
 def _find_anchors(hdr_words: List[_W], pw: float,
@@ -400,19 +430,28 @@ def _find_anchors(hdr_words: List[_W], pw: float,
     Three-stage anchor detection — Stage 2 (data evidence) ALWAYS runs
     and ALWAYS wins over Stage 1 (header keywords) for Rev Code and CPT.
 
-    Stage 1 — header keyword scan (left→right order)
-    Stage 2 — scan ALL data rows for actual rev/cpt/date/amount tokens,
-              build median x-positions, use them to pin every column anchor
-    Stage 3 — enforce minimum spacing so zones never collapse
+    Stage 1 — header keyword scan, KEYWORD-major: for each column, its
+              keywords are tried in priority order against all header
+              words. This lets "Amount" claim the word "Amount" inside
+              "Charge Amount" instead of the earlier word "Charge".
+              Columns claimed from the header are PINNED: Stage 3 will
+              not shove them around (needed for layouts where CPT sits
+              LEFT of Rev Code, e.g. Svc Date | CPT Code | Rev Code | NDC).
+    Stage 1b — leftover header words matching _IGNORE_COL_KW become
+              ignore-zone anchors (__IGNOREn) that swallow their column's
+              data so it never leaks into the 7 output columns.
+    Stage 2 — data-row evidence refinement (unchanged).
+    Stage 3 — fallbacks + minimum spacing, skipped for pinned anchors.
     """
     hw = sorted(hdr_words, key=lambda w: w.x)
 
-    # ── Stage 1: keyword matching (left→right) ────────────────────────────────
+    # ── Stage 1: keyword matching (keyword-major) ─────────────────────────────
     all_txt = " ".join(re.sub(r"[^a-z0-9]+"," ", _lo(w.text)) for w in hw)
     is_f3 = ("rev" in all_txt.split() and "date" in all_txt.split()
              and "procedure" in all_txt.split() and "svc" not in all_txt.split())
 
     anchors: Dict[str, float] = {}
+    pinned: set = set()
     used: set = set()
     col_order = (["Rev Code","Svc Date","CPT#/HCPCS","Description","Qty","Amount"]
                  if is_f3 else
@@ -422,13 +461,47 @@ def _find_anchors(hdr_words: List[_W], pw: float,
         kws = (["date"] if (col == "Svc Date" and is_f3)
                else ["svc","dos","date"] if col == "Svc Date"
                else _COL_KW.get(col, []))
-        for i, w in enumerate(hw):
-            if i in used: continue
-            lo = re.sub(r"[^a-z0-9]+"," ", _lo(w.text))
-            if any(re.search(r"\b"+re.escape(kw)+r"\b", lo) for kw in kws):
-                anchors[col] = w.x
-                used.add(i)
-                break
+        found = False
+        for kw in kws:                      # keyword-major
+            for i, w in enumerate(hw):
+                if i in used: continue
+                lo = re.sub(r"[^a-z0-9]+"," ", _lo(w.text))
+                if re.search(r"\b"+re.escape(kw)+r"\b", lo):
+                    anchors[col] = w.x
+                    pinned.add(col)
+                    used.add(i)
+                    found = True
+                    break
+            if found: break
+
+    # ── Stage 1b: ignore-zone anchors for extra columns (CLUSTER-BASED) ──────
+    # Header words are grouped into visual column labels by x-gap. Any
+    # cluster containing NO claimed word and NO existing anchor is a
+    # column this PDF has that the 7 canonical columns don't ("Charge
+    # Code", "Charge Description", "Txn Code", "ITEM NUMBER", "CDM",
+    # "Bill Ref", "NDC"...) — it gets an ignore zone REGARDLESS of what
+    # its words say, so no keyword list can miss it. Clusters that
+    # contain a claimed anchor are that column's own label and never
+    # spawn phantom zones (the "CDM" of "CDM Amt" can't split off).
+    ign_n = 0
+    gap_thr = max(14.0, pw * 0.02)
+    _clusters: List[List[int]] = []
+    for i, w in enumerate(hw):
+        if _clusters and w.x - max(hw[j].x2 for j in _clusters[-1]) <= gap_thr:
+            _clusters[-1].append(i)
+        else:
+            _clusters.append([i])
+    for cl in _clusters:
+        if any(i in used for i in cl):
+            continue
+        cl_l = min(hw[i].x for i in cl)
+        cl_r = max(hw[i].x2 for i in cl)
+        if any(cl_l - 8 <= ax <= cl_r + 8 for ax in anchors.values()):
+            continue
+        ign_n += 1
+        anchors[f"__IGNORE{ign_n}"] = cl_l
+        for i in cl:
+            used.add(i)
 
     # ── Stage 2: data-row evidence (ALWAYS runs, overrides Stage 1) ──────────
     # Scan every data row word and bucket by what it looks like.
@@ -511,23 +584,32 @@ def _find_anchors(hdr_words: List[_W], pw: float,
             elif abs(anchors["Amount"] - data_amt_x) > 20:
                 anchors["Amount"] = data_amt_x
 
+    # Snapshot for output labeling BEFORE Stage 3: Stage 3 fabricates
+    # missing columns and shifts anchors for zone-width reasons (e.g. the
+    # Description width rule), which must not affect which header words
+    # belong to which label. Fabricated columns are absent here, so they
+    # can never claim a label.
+    _label_anchor_snapshot = dict(anchors)
+
     # ── Stage 3: fallbacks + minimum spacing ──────────────────────────────────
     if "Amount"   not in anchors: anchors["Amount"]  = pw * 0.91
     if "Qty"      not in anchors: anchors["Qty"]     = anchors["Amount"] - pw*0.075
     if "Svc Date" not in anchors: anchors["Svc Date"]= pw * 0.02
 
-    # Rev Code MUST be to the right of Svc Date
+    # Rev Code MUST be to the right of Svc Date — unless the header itself
+    # pinned it elsewhere (new layouts place columns in any order)
     svc_x = anchors["Svc Date"]
     if "Rev Code" not in anchors:
         anchors["Rev Code"] = svc_x + pw*0.07
-    elif anchors["Rev Code"] <= svc_x:
+    elif "Rev Code" not in pinned and anchors["Rev Code"] <= svc_x:
         anchors["Rev Code"] = svc_x + pw*0.07
 
-    # CPT MUST be to the right of Rev Code
+    # CPT to the right of Rev Code — SKIPPED when the header pinned CPT
+    # (e.g. Svc Date | CPT Code | Rev Code | NDC | ... has CPT on the LEFT)
     rev_x = anchors["Rev Code"]
     if "CPT#/HCPCS" not in anchors:
         anchors["CPT#/HCPCS"] = rev_x + pw*0.07
-    elif anchors["CPT#/HCPCS"] <= rev_x:
+    elif "CPT#/HCPCS" not in pinned and anchors["CPT#/HCPCS"] <= rev_x:
         anchors["CPT#/HCPCS"] = rev_x + pw*0.07
 
     # Description zone width guarantee
@@ -541,6 +623,9 @@ def _find_anchors(hdr_words: List[_W], pw: float,
             anchors.get("CPT#/HCPCS", pw*0.2) + pw*0.02,
             anchors["Qty"] - pw*0.25)
 
+    global _PINNED_COLS, _LAST_ANCHORS
+    _PINNED_COLS  = set(pinned)
+    _LAST_ANCHORS = _label_anchor_snapshot   # pre-Stage-3 positions
     if DEBUG: print(f"    is_f3={is_f3}  final anchors: "
                     f"{ {k:round(v) for k,v in sorted(anchors.items(),key=lambda x:x[1])} }")
     return anchors
@@ -563,7 +648,7 @@ def _build_zones(anchors: Dict[str, float],
 
 
 # ── WORD → COLUMN ASSIGNMENT ───────────────────────────────────────────────────
-def _split_merged(w: _W) -> List[_W]:
+def _split_merged(w: _W, rev_right: Optional[float] = None) -> List[_W]:
     """
     Split OCR tokens that merge multiple fields into one bounding box.
     Handles:
@@ -574,8 +659,13 @@ def _split_merged(w: _W) -> List[_W]:
     """
     txt = w.text
 
-    # Pattern 1: date immediately followed by 3-4 digit rev code
-    m = re.match(r"(\d{1,2}/\d{1,2}/\d{2,4})(\d{3,4})(\D.*)?$", txt)
+    # Pattern 1: date immediately followed by 3-4 digit rev code.
+    # Year is FORCED to 2 digits here — with the old greedy \d{2,4} year,
+    # '07/25/240250' split as date='07/25/240' + rev='250' (wrong): the
+    # 4-digit year '2402' backtracked to '240', producing an invalid date
+    # (year '40') which then failed validation, dropped the row's date,
+    # and lost the Rev Code + CPT as a mis-merged continuation line.
+    m = re.match(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2})(\d{3,4})(\D.*)?$", txt)
     if m:
         date_part = m.group(1)
         rev_part  = (m.group(2) + (m.group(3) or "")).strip()
@@ -590,9 +680,28 @@ def _split_merged(w: _W) -> List[_W]:
         clean = m2.group(1).strip()
         return [_W(clean, w.x, w.y, w.x2, w.y2, w.conf)]
 
-    # Pattern 3: 3-4 digit rev code fused with 5-digit CPT (e.g. '030036415')
+    # Pattern 2c: rev code fused with a LETTER code ('0636J1644').
+    # The letter makes this unambiguous — a hospital Px code is all
+    # digits, so this can never shred one. No zone context needed.
+    m2c = re.match(r"(\d{3,4})([A-Za-z]\d{4,5})$", txt)
+    if m2c:
+        frac = len(m2c.group(1)) / max(len(txt), 1)
+        sx   = w.x + w.width * frac
+        return [_W(m2c.group(1), w.x, w.y, sx,   w.y2, w.conf),
+                _W(m2c.group(2).upper(), sx, w.y, w.x2, w.y2, w.conf)]
+
+    # Pattern 3: rev code OCR-fused with a 5-digit CPT ('030036415').
+    # ONLY when the word physically straddles the Rev Code zone's right
+    # boundary — that is what a genuine OCR fusion of two adjacent
+    # columns looks like. A 9-digit hospital Px Code ('020600007',
+    # '030180053') sits INSIDE one zone and must stay whole; the old
+    # unconditional split shredded them into rev+cpt fragments that the
+    # J-recovery then fabricated into J0206/J0301-style junk.
     m3 = re.match(r"(\d{3,4})(\d{5})$", txt)
-    if m3:
+    if m3 and rev_right is not None \
+          and (w.x < rev_right - 4.0 < w.x2) \
+          and m3.group(1).zfill(4) in _COMMON_REV_SET \
+          and not m3.group(2).startswith("000"):
         rev_part = m3.group(1)
         cpt_part = m3.group(2)
         frac     = len(rev_part) / max(len(txt), 1)
@@ -609,10 +718,16 @@ def _split_merged(w: _W) -> List[_W]:
 
 def _assign_row(row: List[_W],
                 zones: List[Tuple[str, float, float]]) -> Dict[str, str]:
-    cells = {c: "" for c in COLS}
+    # Zones may include __IGNOREn columns (NDC/Txn/CDM/Item/Bill Ref...).
+    # Words landing there are captured into those keys and simply never
+    # read by the downstream 7-column pipeline — clean separation.
+    cells = {z[0]: "" for z in zones}
+    for c in COLS:
+        cells.setdefault(c, "")
+    rev_right = next((r for col, l, r in zones if col == "Rev Code"), None)
     expanded: List[_W] = []
     for w in row:
-        expanded.extend(_split_merged(w))
+        expanded.extend(_split_merged(w, rev_right))
 
     for w in sorted(expanded, key=lambda ww: ww.x):
         word_w = max(1.0, w.x2 - w.x)
@@ -683,7 +798,12 @@ def _merge_continuations(raw: List[Dict[str,str]]) -> List[Dict[str,str]]:
         if is_new_charge:
             if cur is not None:
                 merged.append(cur)
-            cur = {c: row.get(c, "") for c in COLS}
+            # copy EVERY key — the __IGNORE zones (Txn Code, Item Number,
+            # Account Number, Charge Code…) were previously dropped here,
+            # which is why those columns showed labels but no data.
+            cur = dict(row)
+            for c in COLS:
+                cur.setdefault(c, "")
         else:
             if cur is None:
                 continue
@@ -713,6 +833,11 @@ def _merge_continuations(raw: List[Dict[str,str]]) -> List[Dict[str,str]]:
                                       + " ".join(extra)).strip()
             if not cur["Qty"]    and row.get("Qty"):    cur["Qty"]    = row["Qty"]
             if not cur["Amount"] and row.get("Amount"): cur["Amount"] = row["Amount"]
+            # ignore-zone continuation values fill empty cells too
+            for k, v in row.items():
+                if k.startswith("__IGNORE") and v.strip() \
+                        and not cur.get(k, "").strip():
+                    cur[k] = v
 
     if cur is not None:
         merged.append(cur)
@@ -755,11 +880,72 @@ def _clean_date(svc_cell: str, joined: str) -> str:
                 return result
     return ""
 
-def _clean_rev(cell: str, joined_row: str, cpt: str, amt: str) -> str:
+# Module-level set of common hospital revenue codes, used both by
+# _clean_rev's Strategy 9 and by _normalize_rev below.
+_COMMON_REV_SET = {
+    "0100","0101","0110","0111","0120","0121","0123","0130","0131",
+    "0169","0174","0206","0214","0255","0385","0603","0610","0611",
+    "0636","0762",
+    "0200","0201","0202","0210","0211","0212","0219","0220","0221",
+    "0250","0251","0252","0258","0259",
+    "0270","0271","0272","0273","0274","0275","0276","0277","0278",
+    "0300","0301","0302","0303","0304","0305","0306","0307","0308","0309",
+    "0310","0320","0321","0322","0323","0324","0325","0329",
+    "0350","0351","0352","0360","0361","0369",
+    "0390","0391","0392","0399",
+    "0400","0401","0402","0403","0404","0409",
+    "0410","0411","0412","0413","0419",
+    "0420","0421","0422","0423","0424","0429",
+    "0450","0451","0452","0453","0454","0455","0456","0457","0459",
+    "0460","0461","0469","0480","0481","0482","0483","0489",
+    "0500","0501","0509","0510","0511","0512","0519",
+    "0550","0630","0631","0632","0633","0634","0635","0636","0637","0639",
+    "0710","0711","0719","0720","0721","0722","0723","0724","0729",
+    "0730","0731","0732","0733","0739","0809",
+    "0900","0901","0902","0903","0904","0905","0906","0907","0908","0909",
+    "0910","0911","0912","0913","0914","0915","0916","0917","0918","0919",
+    "0920","0921","0922","0923","0924","0925","0926","0929",
+    "0940","0941","0942","0943","0944","0945","0946","0947","0948","0949",
+}
+
+def _normalize_rev(rev: str) -> str:
+    """
+    Fix OCR digit-scrambles like 0025→0250 / 0030→0300 — but ONLY for
+    values starting '00', which no real revenue code does. The old
+    version rearranged ANY code missing from the common set, which
+    corrupted legitimate codes (0123 Pediatric Room became 0321).
+    """
+    if not rev:
+        return rev
+    s = rev.zfill(4)
+    if s in _COMMON_REV_SET:
+        return s
+    if not s.startswith("00") or s == "0000":
+        return s
+    matches = [k for k in _COMMON_REV_SET if sorted(k) == sorted(s)]
+    if len(matches) == 1:
+        return matches[0]
+    return s
+
+def _clean_rev(cell: str, joined_row: str, cpt: str, amt: str,
+               desc_cell: str = "") -> str:
     """
     Six-strategy Rev Code extraction — tries each in order, returns first hit.
     Revenue codes are always exactly 3-4 digits (e.g. 0300, 0250, 110, 0121).
     """
+    def _in_desc(s: str) -> bool:
+        if not desc_cell: return False
+        return bool(re.search(r"(?<![0-9])" + re.escape(s.lstrip("0") or s)
+                              + r"(?![0-9])", desc_cell)) or \
+               bool(re.search(r"(?<![0-9])" + re.escape(s) + r"(?![0-9])",
+                              desc_cell))
+
+    def _letter_glued(m, text: str) -> bool:
+        a = m.start(1); b = m.end(1)
+        before = text[a-1] if a > 0 else " "
+        after  = text[b]   if b < len(text) else " "
+        return before.isalpha() or after.isalpha()
+
     def _is_valid_rev(s: str) -> bool:
         s = s.strip()
         if not RE_REV_STRICT.fullmatch(s) or s in {"0000"}:
@@ -836,6 +1022,8 @@ def _clean_rev(cell: str, joined_row: str, cpt: str, amt: str) -> str:
     text = _RE_MASK_HC.sub(" HCTOKEN ", text)            # HC-prefix codes
     text = _RE_MASK_LETTER.sub(" CPTTOKEN ", text)       # J1644 etc.
     for m in re.finditer(r"(?<![0-9])(\d{3,4})(?![0-9])", text):
+        if _letter_glued(m, text):   continue   # 1000ML, 750MG, 325MG…
+        if _in_desc(m.group(1)):     continue   # "603 GYN ROOM PRIVATE"
         if _is_valid_rev(m.group(1)):
             return m.group(1).zfill(4)
 
@@ -863,7 +1051,9 @@ def _clean_rev(cell: str, joined_row: str, cpt: str, amt: str) -> str:
     if date_m:
         after_date = joined_row[date_m.end():]
         m8 = re.match(r"\s*[^\d]{0,3}(\d{3,4})(?!\d)", after_date)
-        if m8 and _is_valid_rev(m8.group(1)):
+        if m8 and not _letter_glued(m8, after_date) \
+              and not _in_desc(m8.group(1)) \
+              and _is_valid_rev(m8.group(1)):
             return m8.group(1).zfill(4)
 
     # ── Strategy 9: OCR digit-rearrangement correction ───────────────────────
@@ -871,7 +1061,9 @@ def _clean_rev(cell: str, joined_row: str, cpt: str, amt: str) -> str:
     # 0300 → 0030). We detect this by checking if the candidate contains
     # the same digits as any common rev code in a different order.
     _COMMON_REV_CODES = {
-        "0100","0101","0110","0111","0120","0121","0130","0131",
+        "0100","0101","0110","0111","0120","0121","0123","0130","0131",
+    "0169","0174","0206","0214","0255","0385","0603","0610","0611",
+    "0636","0762",
         "0200","0201","0202","0210","0211","0212","0219","0220","0221",
         "0250","0251","0252","0258","0259",
         "0270","0271","0272","0273","0274","0275","0276","0277","0278",
@@ -981,31 +1173,47 @@ def _clean_cpt(cell: str) -> str:
         if RE_CPT.fullmatch(tok):
             return tok
 
-        # "1644" (4 digits) → "J1644" : J dropped entirely
-        if re.fullmatch(r"[1-9]\d{3}", tok):
-            candidate = "J" + tok
-            if RE_CPT.fullmatch(candidate):
-                return candidate
-        # "0644" → "J0644" etc.
-        if re.fullmatch(r"0\d{3}", tok):
-            candidate = "J" + tok
-            if RE_CPT.fullmatch(candidate):
-                return candidate
+        # 4-digit letter-drop recovery ("1644" → "J1644") is allowed
+        # ONLY for codes in the curated set. The old RE_CPT-only check
+        # accepted ANY J+4-digits, so every rev code that drifted into
+        # the CPT zone became a fake J-code (J0123, J0300, J0450...).
+        if re.fullmatch(r"\d{4}", tok):
+            for p in ("J","C","L","Q","A","G","P"):
+                candidate = p + tok
+                if candidate in _KNOWN_HCPCS_CORRECTIONS:
+                    return candidate
         return ""
+
+    # Hospital internal Px/Item codes are 7-12 digit numerics
+    # ('020600007', '1230000001', '7300080'). They ARE this PDF's code
+    # column value — output them exactly as printed, no correction.
+    solo = _strip_junk(t)
+    if re.fullmatch(r"\d{7,12}", solo):
+        return solo
 
     # Try each token in the cell
     for tok in t.split():
         tok2 = _strip_junk(tok)
+        if re.fullmatch(r"\d{7,12}", tok2):
+            return tok2
         result = _fix_ocr_code(tok2)
         if result:
             return result
 
-    # Regex search: find known CPT patterns anywhere in cell text
+    # Regex search: find known CPT patterns anywhere in cell text.
+    # IMPORTANT: each hit must go through _fix_ocr_code — tokens with
+    # trailing punctuation (e.g. "17050." or "17050,") fail the
+    # token-level fullmatch above, land here via findall as "17050",
+    # and previously got returned RAW without the J→1 OCR correction.
     hits = re.findall(
         r"HC[A-Z0-9]{3,}"    # HC-prefix codes (HC25200001 etc.)
         r"|[A-Z]\d{4,5}"     # letter + 4-5 digits (J1644, C1769, etc.)
         r"|\b\d{5}\b",        # 5-digit CPT (80053, 82330 etc.)
         t)
+    for hit in hits:
+        corrected = _fix_ocr_code(hit)
+        if corrected:
+            return corrected
     if hits:
         return hits[0]
 
@@ -1103,9 +1311,17 @@ def _clean_qty(cell: str, joined_row: str = "", desc: str = "",
         amt_pattern = re.escape(amt.lstrip("-"))
         m2 = re.search(r"(?<![\d.])(\d{1,4})\s+\$?" + amt_pattern, joined_row)
         if m2:
-            v = _valid_qty(m2.group(1), context=joined_row)
-            if v is not None:
-                return str(v)
+            # Guard: reject if the qty candidate is immediately preceded by
+            # a 4+ digit number (catalog/lot sequence like "55150 297 197.98"
+            # or "43066 400 335.81"). Real qty is always at the START of the
+            # qty column, never embedded in a multi-number catalog string.
+            pre_start = max(0, m2.start(1) - 15)
+            before_text = joined_row[pre_start:m2.start(1)].strip()
+            catalog_before = bool(re.search(r"\d{4,}\s*$", before_text))
+            if not catalog_before:
+                v = _valid_qty(m2.group(1), context=joined_row)
+                if v is not None:
+                    return str(v)
 
     # ── Strategy 3: trailing bare integer in Description that isn't part
     #                of a dosage/measurement phrase ─────────────────────────
@@ -1131,20 +1347,38 @@ def _clean_qty(cell: str, joined_row: str = "", desc: str = "",
 
 def _clean_amount(cell: str, joined: str) -> str:
     """
-    Extract dollar amount — rightmost match wins.
-    Also handles negative amounts in parentheses: (10.00) → -10.00
+    Extract the rightmost amount. OCR sometimes breaks the thousands
+    separator ("5,019.00" read as "5 019.00" or "5.019.00"), which made
+    the rightmost match "019.00" → 19.00. Broken separators are repaired
+    (digit + [space/dot] + exactly-3-digits + ".dd" collapses) before
+    matching, restoring the full 5019.00.
     """
-    for src in [cell, joined]:
-        hits = list(RE_AMOUNT.finditer(src))
+    def _repair(s: str) -> str:
+        prev = None
+        while prev != s:
+            prev = s
+            s = re.sub(r"(?<=\d)[ .](?=\d{3}\.\d{2}\b)", "", s)
+        return s
+
+    def _norm(raw: str) -> str:
+        raw = raw.strip()
+        neg = raw.startswith("(") and raw.endswith(")")
+        raw = raw.strip("()").lstrip("$").replace(",", "")
+        try:
+            v = float(raw)
+            return f"-{v:.2f}" if neg else f"{v:.2f}"
+        except Exception:
+            return ""
+
+    for srctxt in (cell, joined):
+        if not srctxt:
+            continue
+        s = _repair(srctxt)
+        hits = list(RE_AMOUNT.finditer(s))
         if hits:
-            raw = hits[-1].group(0).strip()
-            negative = raw.startswith("(") and raw.endswith(")")
-            raw = raw.strip("()").replace(",", "")
-            try:
-                v = float(raw)
-                return f"-{v:.2f}" if negative else f"{v:.2f}"
-            except:
-                pass
+            r = _norm(hits[-1].group(0))
+            if r:
+                return r
     return ""
 
 def _clean_desc(desc: str, cpt: str, mod: str,
@@ -1169,14 +1403,37 @@ def _clean_row(row: Dict[str,str]) -> Optional[List[str]]:
     joined = " ".join(row.values())
     if _skip(joined): return None
 
+    # Rev-code rescue must NEVER mine the Description text: "603 GYN
+    # ROOM", "IRRIGATION 1000ML", "300MG" were being turned into
+    # fabricated rev codes 0603 / 1000 / 0300 on rows whose Rev cell is
+    # legitimately blank (grouped formats print the code once per group).
+    joined_no_desc = " ".join(v for k, v in row.items()
+                              if k != "Description")
+
     date = _clean_date(row.get("Svc Date",""), joined)
     if not date: return None
 
     amt  = _clean_amount(row.get("Amount",""), joined)
     cpt  = _clean_cpt(row.get("CPT#/HCPCS",""))
-    rev  = _clean_rev(row.get("Rev Code",""), joined, cpt, amt)
     mod  = _clean_mod(row.get("Mod",""))
     desc_raw = re.sub(r"\s+", " ", row.get("Description","")).strip()
+
+    # CPT rescue: a code glued to the front of the Description cell
+    # ('71045 XR CHEST,1 VIEW') moves into the empty CPT column.
+    # Only fires for real CPT shapes (5-digit or letter+4-5 digits),
+    # never for 7-12 digit internal Px codes or short numbers like the
+    # '603' in '603 GYN ROOM PRIVATE'.
+    if not cpt and desc_raw:
+        m = re.match(r"((?:HC[A-Z0-9]{3,})|[A-Z]\d{4,5}|\d{5})\s+(?=[A-Za-z(])",
+                     desc_raw, re.I)
+        if m and not re.match(r"\d{7,12}\b", desc_raw):
+            cpt      = m.group(1).upper()
+            desc_raw = desc_raw[m.end():].strip()
+
+    # Rev Code AFTER the description is known, so the rescue strategies
+    # can refuse candidates that live inside the description text
+    rev  = _normalize_rev(_clean_rev(row.get("Rev Code",""), joined, cpt,
+                                     amt, desc_cell=desc_raw))
 
     # Qty needs the raw description (before field-stripping) and the
     # joined row text so its rescue strategies can find positional evidence
@@ -1263,9 +1520,93 @@ def _empirical_zones(data_rows: List[List[_W]], pw: float):
 # ── PAGE EXTRACTION ────────────────────────────────────────────────────────────
 _last_zones: Optional[List] = None
 _last_pw:    float           = 0.0
+_last_schema: Optional[dict] = None
+_PINNED_COLS: set            = set()
+_LAST_ANCHORS: Dict[str, float] = {}
+
+def _build_schema(zones, hdr_words) -> dict:
+    """
+    Record the PDF's OWN column labels for this table (output-layer only;
+    the extraction pipeline is untouched).
+
+    How labels are built now:
+      1. Cluster the header words into VISUAL column labels by x-gap
+         (words closer than ~2% page width belong to the same label,
+         two-line stacked headers overlap in x so they join too).
+         A CDM bill yields clusters: [CDM] [Service Date] [CDM Descr]
+         [CDM Amt] [CDM QTY] [CDM Rate] [Rev Code] [Bill Ref].
+      2. Each CLUSTER is assigned to its single nearest column anchor
+         (from _LAST_ANCHORS). A cluster containing an anchor assigns
+         at distance 0; otherwise the gap to the cluster edge must be
+         under max(60px, cluster width). Fabricated fallback anchors
+         (a CPT zone invented for a PDF with no CPT column) sit far
+         from every cluster and receive no label.
+      3. An anchor that wins several clusters keeps only the nearest.
+    """
+    order = [z[0] for z in zones]
+    labels = {n: "" for n in order}
+    words = sorted((hdr_words or []), key=lambda w: w.x)
+    if words and _LAST_ANCHORS:
+        # page width estimate from zones (right edge of last zone)
+        pw = max(r for _, _, r in zones)
+        gap_thr = max(14.0, pw * 0.02)
+
+        # 1. cluster words into visual labels
+        clusters = [[words[0]]]
+        for w in words[1:]:
+            if w.x - max(x.x2 for x in clusters[-1]) > gap_thr:
+                clusters.append([w])
+            else:
+                clusters[-1].append(w)
+
+        # 2/3. assign each cluster to its nearest anchor.
+        # TIGHT-HEADER SPLIT: a PDF whose column names sit close together
+        # ("Svc Date Rev Px Code") produces one cluster containing SEVERAL
+        # anchors. Splitting the cluster's words among those anchors by
+        # proximity recovers the individual labels ("Svc Date", "Rev",
+        # "Px Code") instead of gluing them onto one column.
+        def _fmt(wlist):
+            t = " ".join(x.text for x in sorted(wlist, key=lambda t: (t.cy, t.x)))
+            return re.sub(r"\s*/\s*", "/", re.sub(r"\s+", " ", t)).strip()
+
+        best_for_anchor: Dict[str, Tuple[float, str]] = {}
+        for c in clusters:
+            cl = min(x.x for x in c); cr = max(x.x2 for x in c)
+            inside = [n for n in order
+                      if _LAST_ANCHORS.get(n) is not None
+                      and cl - 8 <= _LAST_ANCHORS[n] <= cr + 8]
+            if len(inside) >= 2:
+                buckets: Dict[str, list] = {n: [] for n in inside}
+                for x in c:
+                    nn = min(inside,
+                             key=lambda n: abs(x.x - _LAST_ANCHORS[n]))
+                    buckets[nn].append(x)
+                for n, wl in buckets.items():
+                    if wl:
+                        best_for_anchor[n] = (0.0, _fmt(wl))
+                continue
+            txt = _fmt(c)
+            near_name, near_d = None, None
+            for name in order:
+                ax = _LAST_ANCHORS.get(name)
+                if ax is None: continue
+                d = 0.0 if cl <= ax <= cr else min(abs(ax-cl), abs(ax-cr))
+                if near_d is None or d < near_d:
+                    near_d, near_name = d, name
+            if near_name is None: continue
+            if near_d > max(60.0, cr - cl): continue
+            prev = best_for_anchor.get(near_name)
+            if prev is None or near_d < prev[0]:
+                best_for_anchor[near_name] = (near_d, txt)
+        for name, (_, txt) in best_for_anchor.items():
+            labels[name] = txt
+
+    lab_list = [labels[n] for n in order]
+    return {"order": order, "labels": lab_list,
+            "sig": tuple(lab_list) + ("|",) + tuple(order)}
 
 def _process_page(page, pg_no: int):
-    global _last_zones, _last_pw
+    global _last_zones, _last_pw, _last_schema
 
     words, pw = _best_words(page)
     rows      = _group_rows(words)
@@ -1285,31 +1626,44 @@ def _process_page(page, pg_no: int):
         if hi >= 0:
             hdr_words = list(rows[hi])
             nxt = hi+1
-            if nxt < ds and _is_hdr(_rtxt(rows[nxt])) and not RE_DATE.search(_rtxt(rows[nxt])):
-                hdr_words += rows[nxt]
+            if nxt < ds:
+                t2 = _rtxt(rows[nxt])
+                # A stacked second header line often scores below the
+                # header threshold ("NUMBER CODE SERVICE NUMBER" = 2), so
+                # also absorb short, digit-free, date-free, amount-free
+                # lines — losing them cost the ITEM NUMBER column its
+                # anchor and truncated labels like "DATE OF".
+                if (not RE_DATE.search(t2) and not RE_AMOUNT.search(t2)
+                        and (_is_hdr(t2)
+                             or (len(rows[nxt]) <= 8
+                                 and not re.search(r"\d{3,}", t2)))):
+                    hdr_words += rows[nxt]
             if DEBUG:
                 print(f"    sec {sec_no} hdr@{hi}: '{_rtxt(hdr_words)[:80]}'")
             # Pass data rows to _find_anchors for Stage 2 evidence
             anchors = _find_anchors(hdr_words, pw, data_rows=data_rows_raw)
             zones   = _build_zones(anchors, pw)
-            _last_zones = zones; _last_pw = pw
+            schema  = _build_schema(zones, hdr_words)
+            _last_zones = zones; _last_pw = pw; _last_schema = schema
             if DEBUG:
                 for col, l, r in zones:
                     print(f"      {col:15s} [{l:5.0f}–{r:5.0f}]")
         else:
             if _last_zones and abs(pw - _last_pw) < 30:
                 zones = _last_zones
+                schema = _last_schema or _build_schema(zones, [])
                 if DEBUG: print(f"    sec {sec_no} no header — reusing zones")
             else:
                 zones = _empirical_zones(data_rows_raw, pw)
-                _last_zones = zones; _last_pw = pw
+                schema = _build_schema(zones, [])
+                _last_zones = zones; _last_pw = pw; _last_schema = schema
                 if DEBUG: print(f"    sec {sec_no} no header — empirical zones")
 
         raw_dicts = []
         for row in data_rows_raw:
             txt = _rtxt(row)
             if not txt: continue
-            if _is_footer(txt) or _is_meta(txt) or _is_label(txt):
+            if _skip(txt):
                 dbg.append([pg_no, sec_no, "skip", txt]); continue
             if _is_hdr(txt) and not RE_DATE.search(txt):
                 dbg.append([pg_no, sec_no, "skip-hdr", txt]); continue
@@ -1320,10 +1674,37 @@ def _process_page(page, pg_no: int):
             raw_dicts.append(assigned)
 
         merged = _merge_continuations(raw_dicts)
+
+        # Spillover rescue: when the Svc Date zone boundary squeezes the
+        # neighbouring extra column (PIH Txn Code), its value ends up
+        # trapped behind the date in the Svc Date cell and was silently
+        # discarded by date extraction. Move a trailing 5-12 digit token
+        # into the empty ignore zone immediately to the right.
+        zn = [z[0] for z in zones]
+        right_ign = None
+        if "Svc Date" in zn:
+            si = zn.index("Svc Date")
+            if si + 1 < len(zn) and zn[si+1].startswith("__IGNORE"):
+                right_ign = zn[si+1]
+        if right_ign:
+            for rd in merged:
+                if rd.get(right_ign, "").strip():
+                    continue
+                m = re.match(r"^(.*?\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+"
+                             r"(\d{5,12})$",
+                             rd.get("Svc Date", "").strip())
+                if m:
+                    rd["Svc Date"] = m.group(1)
+                    rd[right_ign]  = m.group(2)
+
         for rd in merged:
             final = _clean_row(rd)
             if final:
-                out.append(final)
+                extras = {k: re.sub(r"\s+", " ", _strip_junk(v)).strip()
+                          for k, v in rd.items()
+                          if k.startswith("__IGNORE")}
+                out.append({"schema": schema, "core": final,
+                            "extras": extras})
                 dbg.append([pg_no, sec_no, "FINAL", ""] + final)
             else:
                 dbg.append([pg_no, sec_no, "rejected",
@@ -1362,34 +1743,153 @@ def _dedup_final_rows(rows: List[List[str]]) -> List[List[str]]:
 
 def _carry_forward_amounts(rows: List[List[str]]) -> List[List[str]]:
     """
-    For rows missing an Amount: look back up to 10 rows for a row with the
-    same Rev Code AND same CPT code that has an Amount. If found, borrow it.
-
-    Rationale: in hospital billing, the same service code (Rev+CPT) always
-    has the same unit price on the same bill. When OCR misses the amount on
-    a repeated row, we can safely infer it from the identical adjacent rows.
-
-    Safety guard: only apply when BOTH Rev Code AND CPT match (not just one),
-    to avoid incorrectly borrowing amounts across different service codes.
+    For rows missing an Amount: borrow from nearby rows with same Rev+CPT.
+    Safe because same service code always has the same unit price on one bill.
     """
     result = [list(r) for r in rows]
-    amt_cache: Dict[str, str] = {}  # key: "rev|cpt" → amount
-
-    # First pass: populate cache from rows that have amounts
+    amt_cache: Dict[str, str] = {}
     for row in result:
-        date, rev, cpt, mod, desc, qty, amt = row
+        rev, cpt, amt = row[1], row[2], row[6]
         if rev and cpt and amt:
             amt_cache[f"{rev}|{cpt}"] = amt
-
-    # Second pass: fill blanks using cache
     for row in result:
-        date, rev, cpt, mod, desc, qty, amt = row
-        if not amt and rev and cpt:
-            cached = amt_cache.get(f"{rev}|{cpt}", "")
+        if not row[6] and row[1] and row[2]:
+            cached = amt_cache.get(f"{row[1]}|{row[2]}", "")
             if cached:
-                row[6] = cached  # Amount is index 6
+                row[6] = cached
+    return result
+
+
+def _dkey_precise(desc: str) -> str:
+    """Precise key: first 6 normalized words (digits included)."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", desc.lower()).split()
+    return " ".join(words[:6])
+
+def _dkey_loose(desc: str) -> str:
+    """
+    Loose fallback key: first 2 ALPHABETIC words of length >= 4.
+    Digits and short tokens are dropped, so an OCR garble inside the
+    dosage part of a drug name ("0.25 Ma/Ml" vs "0.25 Mg/Ml") does not
+    change the key: both variants of
+        "Bumetanide 0.25 Mg/Ml Soln (68462-469-40)"
+        "Bumetanide 0.25 Ma/Ml Soln (68462-469-4"
+    reduce to "bumetanide soln".
+    Returns "" when fewer than 2 qualifying words exist (key too weak).
+    """
+    words = [w for w in re.sub(r"[^a-z ]+", " ", desc.lower()).split()
+             if len(w) >= 4]
+    if len(words) < 2:
+        return ""
+    return " ".join(words[:2])
+
+def _carry_forward_rev_codes(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Fill blank Rev Codes using TWO-TIER description-keyed global maps.
+
+    Tier 1 — precise key (first 6 normalized words). Exact repeated rows
+    match here.
+
+    Tier 2 — loose key (first 2 alphabetic words >= 4 chars). Catches rows
+    where OCR garbled a character inside the first 6 words, e.g.
+    "Bumetanide 0.25 Ma/Ml Soln" (OCR) vs "Bumetanide 0.25 Mg/Ml Soln"
+    (clean) — the precise keys differ ("ma" vs "mg") but both reduce to
+    the loose key "bumetanide soln".
+
+    BOTH tiers use a uniqueness guard: a key seen with two different rev
+    codes fills nothing. E.g. "room charge" (loose key for both
+    "HC ROOM CHARGE PVT MONITOR" and "HC ROOM CHARGE PRIVATE") maps to
+    {0110} only, so it fills; but a loose key mapping to {0250, 0300}
+    would be skipped.
+
+    Pass 3 afterwards: same-date neighbor majority vote for rows whose
+    description matched nothing (unique one-off garbled rows).
+    """
+    from collections import Counter
+    result = [list(r) for r in rows]
+    n = len(result)
+
+    # Build both maps from rows that have rev + description
+    precise_map: Dict[str, set] = {}
+    loose_map:   Dict[str, set] = {}
+    for row in result:
+        if row[1] and row[4]:
+            pk = _dkey_precise(row[4])
+            if len(pk) >= 8:
+                precise_map.setdefault(pk, set()).add(row[1])
+            lk = _dkey_loose(row[4])
+            if lk:
+                loose_map.setdefault(lk, set()).add(row[1])
+
+    # Fill blanks: precise first, loose fallback — unique match only
+    for row in result:
+        if row[1] or not row[0] or not row[4]:
+            continue
+        pk = _dkey_precise(row[4])
+        revs = precise_map.get(pk, set())
+        if len(revs) == 1:
+            row[1] = next(iter(revs))
+            continue
+        lk = _dkey_loose(row[4])
+        if lk:
+            revs = loose_map.get(lk, set())
+            if len(revs) == 1:
+                row[1] = next(iter(revs))
+
+    # (Neighbor-vote fill removed: a rev code is printed ONLY when the
+    # PDF shows it on that row or on another row with the same charge
+    # description — never inferred from adjacent unrelated rows.)
 
     return result
+
+
+def _carry_forward_cpt_codes(rows: List[List[str]]) -> List[List[str]]:
+    """
+    Fill blank CPT codes using the same TWO-TIER description-keyed maps
+    as the rev-code fill (precise 6-word key, then loose 2-alphabetic-word
+    fallback), each with a uniqueness guard.
+
+    The loose tier is what recovers OCR-garbled repeats: a Bumetanide row
+    whose description OCR'd as "Bumetanide 0.25 Ma/Ml Soln" gets no
+    precise-key match against the clean "Mg/Ml" rows, but its loose key
+    "bumetanide soln" maps to exactly {J1939} → filled.
+
+    Ambiguity stays safe: "HC ROOM CHARGE PVT MONITOR" (HC11000002) and
+    "HC ROOM CHARGE PRIVATE" (HC11000001) share the loose key
+    "room charge" → the set has two CPTs → nothing is filled from the
+    loose tier, while their precise keys differ and still fill correctly.
+
+    Rows whose description genuinely has no CPT anywhere in the document
+    (pharmacy lines printed with "-") get no map entry and stay blank.
+    """
+    result = [list(r) for r in rows]
+
+    precise_map: Dict[str, set] = {}
+    loose_map:   Dict[str, set] = {}
+    for row in result:
+        if row[2] and row[4]:
+            pk = _dkey_precise(row[4])
+            if len(pk) >= 8:
+                precise_map.setdefault(pk, set()).add(row[2])
+            lk = _dkey_loose(row[4])
+            if lk:
+                loose_map.setdefault(lk, set()).add(row[2])
+
+    for row in result:
+        if row[2] or not row[0] or not row[4]:
+            continue
+        pk = _dkey_precise(row[4])
+        cpts = precise_map.get(pk, set())
+        if len(cpts) == 1:
+            row[2] = next(iter(cpts))
+            continue
+        lk = _dkey_loose(row[4])
+        if lk:
+            cpts = loose_map.get(lk, set())
+            if len(cpts) == 1:
+                row[2] = next(iter(cpts))
+
+    return result
+
 
 
 def _report_accuracy(rows: List[List[str]], filename: str):
@@ -1431,16 +1931,30 @@ def process_pdf(path: str):
     finally:
         doc.close()
 
+    # Dedup on the FULL record (core + extras + schema) — same semantics
+    # as before, extended so extra columns stay aligned with their rows.
     before_dedup = len(all_rows)
-    all_rows = _dedup_final_rows(all_rows)
-    all_rows = _carry_forward_amounts(all_rows)
+    seen = set(); uniq = []
+    for rec in all_rows:
+        k = (rec["schema"]["sig"], tuple(rec["core"]),
+             tuple(sorted(rec["extras"].items())))
+        if k in seen: continue
+        seen.add(k); uniq.append(rec)
+    all_rows = uniq
     removed = before_dedup - len(all_rows)
     if removed and DEBUG:
-        print(f"\n  Removed {removed} duplicate row(s) "
-              f"(same Svc Date + Rev Code + CPT + Amount)")
+        print(f"\n  Removed {removed} exact duplicate row(s)")
 
-    acc = _report_accuracy(all_rows, os.path.basename(path))
-    _write_excel(all_rows, all_dbg, acc, dest)
+    # Existing carry-forwards run UNCHANGED on the canonical cores
+    cores = [rec["core"] for rec in all_rows]
+    cores = _carry_forward_rev_codes(cores)
+    cores = _carry_forward_cpt_codes(cores)
+    cores = _carry_forward_amounts(cores)
+    for rec, core in zip(all_rows, cores):
+        rec["core"] = core
+
+    acc = _report_accuracy(cores, os.path.basename(path))
+    _write_excel_dynamic(all_rows, all_dbg, acc, dest)
     print(f"\nDone: {len(all_rows)} rows  →  {dest}")
 
 # ── EXCEL WRITER ───────────────────────────────────────────────────────────────
@@ -1479,6 +1993,134 @@ def _write_excel(rows, dbg, acc_data, path: str):
             ac.column_dimensions[get_column_letter(ci)].width = w
 
     # Debug sheet
+    ds = wb.create_sheet("Debug_Raw")
+    ds.append(["Page","Sec","Status","Raw_Text"] + COLS)
+    for c in ds[1]: c.fill=hfill; c.font=hfont; c.alignment=ha
+    for row in dbg: ds.append([str(v) for v in row])
+    for ci, w in enumerate([6,6,14,110,13,10,14,7,65,7,14], 1):
+        ds.column_dimensions[get_column_letter(ci)].width = w
+    ds.freeze_panes = "A2"
+
+    wb.save(path)
+    print(f"  Saved → {path}")
+
+# ── DYNAMIC EXCEL WRITER (PDF's own column names) ─────────────────────────────
+def _write_excel_dynamic(records, dbg, acc_data, path: str):
+    """
+    ONE "Charges" sheet per PDF, columns titled with the PDF's OWN names.
+
+    Page-to-page OCR noise makes header signatures differ slightly, which
+    previously scattered the same table across Charges / Charges_2 / ...
+    Now all records consolidate into a single sheet:
+      • the DOMINANT schema (most rows) sets the column order and labels
+      • canonical columns from minority schemas map by column identity
+      • extra (ignore) columns map across schemas by their LABEL text
+      • canonical columns nobody labels and nobody fills are dropped
+    """
+    wb = Workbook(); wb.remove(wb.active)
+    hfill = PatternFill("solid", fgColor="1F4E79")
+    hfont = Font(bold=True, color="FFFFFF", size=11)
+    ha    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    W = {"Svc Date":13,"Rev Code":10,"CPT#/HCPCS":14,"Mod":7,
+         "Description":60,"Qty":7,"Amount":14}
+
+    def _norm_lbl(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+    ws = wb.create_sheet("Charges")
+
+    if records:
+        # dominant schema = the one with the most rows
+        counts: Dict[tuple, int] = {}
+        first_schema: Dict[tuple, dict] = {}
+        for rec in records:
+            sig = rec["schema"]["sig"]
+            counts[sig] = counts.get(sig, 0) + 1
+            first_schema.setdefault(sig, rec["schema"])
+        dom_sig = max(counts, key=lambda s: counts[s])
+        dom     = first_schema[dom_sig]
+
+        # majority label per canonical column across ALL records
+        lbl_votes: Dict[str, Dict[str, int]] = {}
+        for rec in records:
+            sch = rec["schema"]
+            for zone, lbl in zip(sch["order"], sch["labels"]):
+                if not zone.startswith("__IGNORE") and lbl:
+                    lbl_votes.setdefault(zone, {})
+                    lbl_votes[zone][lbl] = lbl_votes[zone].get(lbl, 0) + 1
+        def canon_label(zone):
+            v = lbl_votes.get(zone, {})
+            return max(v, key=lambda k: v[k]) if v else ""
+
+        has_data = {c: any(r["core"][i].strip() for r in records)
+                    for i, c in enumerate(COLS)}
+
+        columns: List[Tuple[str, str, str]] = []   # (kind, key, display)
+        seen_canon: set = set()
+        seen_ign:   set = set()
+
+        # dominant schema defines the order
+        for zone, lbl in zip(dom["order"], dom["labels"]):
+            if zone.startswith("__IGNORE"):
+                nl = _norm_lbl(lbl)
+                if nl and nl not in seen_ign:
+                    seen_ign.add(nl)
+                    columns.append(("I", nl, lbl))
+            else:
+                l = canon_label(zone)
+                if l or has_data.get(zone):
+                    seen_canon.add(zone)
+                    columns.append(("C", zone, l or zone))
+
+        # anything only the minority schemas have goes at the end
+        for rec in records:
+            sch = rec["schema"]
+            for zone, lbl in zip(sch["order"], sch["labels"]):
+                if zone.startswith("__IGNORE"):
+                    nl = _norm_lbl(lbl)
+                    if nl and nl not in seen_ign \
+                            and rec["extras"].get(zone, "").strip():
+                        seen_ign.add(nl)
+                        columns.append(("I", nl, lbl))
+                elif zone not in seen_canon \
+                        and (canon_label(zone) or has_data.get(zone)):
+                    seen_canon.add(zone)
+                    columns.append(("C", zone, canon_label(zone) or zone))
+
+        for ci, (kind, key, disp) in enumerate(columns, 1):
+            c = ws.cell(row=1, column=ci, value=disp)
+            c.fill=hfill; c.font=hfont; c.alignment=ha
+            ws.column_dimensions[get_column_letter(ci)].width = \
+                W.get(key, 60 if key == "Description" else 14)
+
+        for ri, rec in enumerate(records, 2):
+            sch = rec["schema"]
+            ign_by_lbl = {_norm_lbl(l): z
+                          for z, l in zip(sch["order"], sch["labels"])
+                          if z.startswith("__IGNORE") and l}
+            for ci, (kind, key, _d) in enumerate(columns, 1):
+                if kind == "C":
+                    v = rec["core"][COLS.index(key)]
+                else:
+                    z = ign_by_lbl.get(key)
+                    v = rec["extras"].get(z, "") if z else ""
+                ws.cell(row=ri, column=ci, value=v)
+        ws.freeze_panes = "A2"; ws.row_dimensions[1].height = 28
+    else:
+        ws.cell(row=1, column=1, value="No charge rows detected")
+
+    # Accuracy sheet (canonical fields — unchanged semantics)
+    if acc_data and records:
+        fill, pct, comp, n = acc_data
+        ac = wb.create_sheet("Accuracy")
+        ac.append(["Column","Filled","Total","Fill %"])
+        for c in ac[1]: c.fill=hfill; c.font=hfont; c.alignment=ha
+        for i, col in enumerate(COLS):
+            ac.append([col, fill[i], n, pct[i]])
+        ac.append(["OVERALL (Svc+Desc+Amt)", comp, n, round(100*comp/n)])
+        for ci, w in enumerate([24,10,10,10], 1):
+            ac.column_dimensions[get_column_letter(ci)].width = w
+
     ds = wb.create_sheet("Debug_Raw")
     ds.append(["Page","Sec","Status","Raw_Text"] + COLS)
     for c in ds[1]: c.fill=hfill; c.font=hfont; c.alignment=ha
